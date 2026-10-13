@@ -1,0 +1,35 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>ClickNix warning</title>
+    <link rel="stylesheet" href="warning.css">
+  </head>
+  <body>
+    <main aria-labelledby="warning-title">
+      <img class="hero-logo" src="icons/logo-full.png" width="1120" height="358" alt="ClickNix">
+      <div class="warning-mark" aria-hidden="true">⚠️</div>
+      <h1 id="warning-title">This site contains malware</h1>
+      <p>ClickNix prevented this site from loading because indicators of compromise have been triggered. Notification has been sent to warn defenders in the community to protect other users from this risk also.</p>
+      <p>For your safety close this tab / window. If this is a trusted service you have used before in the past we suggest you reach out to the site owner to warn them about this infection.</p>
+      <p id="error" class="error" role="alert" hidden></p>
+      <div class="actions">
+        <button id="close" class="button primary" type="button">Close this Window</button>
+        <a class="button secondary" href="https://adamnet.io/clickfix" target="_blank" rel="noopener noreferrer">More Info<span class="sr-only"> (opens in a new tab)</span></a>
+      </div>
+      <details id="confirmation" class="confirmation">
+        <summary>Continue to Site</summary>
+        <div class="risk-warning">
+          <p><strong>Warning:</strong> ClickFix attacks often masquerade as a Captcha (Prove that you are a human request) and ask the human to copy and paste a malicious command into their Terminal / Command Prompt / PowerShell. No legitimate Captcha service will ever ask you to paste commands into your Terminal. Note that ClickFix attacks often deceive users by using keyboard shortcuts to open your Terminal and paste these commands out of sight from users. Never do this.</p>
+          <p>Get more information about ClickFix attacks from the community <a href="https://adamnet.io/clickfix" target="_blank" rel="noopener noreferrer">adamnet.io/clickfix<span class="sr-only"> (opens in a new tab)</span></a></p>
+          <button id="continue" class="button acknowledge" type="button" disabled>
+            <span>I understand the risks</span>
+            <strong>Continue to Site</strong>
+          </button>
+        </div>
+      </details>
+    </main>
+    <script type="module" src="warning.js"></script>
+  </body>
+</html>

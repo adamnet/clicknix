@@ -1,0 +1,26 @@
+[
+  {
+    "id": 1,
+    "action": {
+      "type": "modifyHeaders",
+      "responseHeaders": [
+        {
+          "header": "content-security-policy-report-only",
+          "operation": "append",
+          "value": "require-trusted-types-for 'script'"
+        },
+        {
+          "header": "server-timing",
+          "operation": "append",
+          "value": "clicknix-tt"
+        }
+      ]
+    },
+    "condition": {
+      "resourceTypes": ["main_frame", "sub_frame", "object"],
+      "excludedResponseHeaders": [
+        { "header": "content-security-policy", "values": ["*trusted-types*"] }
+      ]
+    }
+  }
+]

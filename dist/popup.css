@@ -1,0 +1,47 @@
+:root {
+  color: #1f2937;
+  background: #fffdf8;
+  font: 14px/1.4 system-ui, sans-serif;
+}
+
+body {
+  width: 280px;
+  margin: 0;
+}
+
+main {
+  padding: 16px;
+}
+
+.brand {
+  align-items: center;
+  display: flex;
+  gap: 10px;
+  margin-bottom: 8px;
+}
+
+.brand img {
+  display: block;
+  width: 190px;
+  height: auto;
+}
+
+h1 {
+  margin: 0;
+  font-size: 17px;
+}
+
+p {
+  margin: 0;
+  color: #6b7280;
+}
+
+.flagged {
+  color: #b42318;
+  font-weight: 650;
+}
+
+.incomplete {
+  color: #92400e;
+  font-weight: 650;
+}
