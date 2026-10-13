@@ -852,12 +852,12 @@ async function __wbg_init(module_or_path) {
 }
 
 // src/bounded-response.js
-async function readBoundedResponseText(response, { maxBytes, maxChars } = {}) {
+async function readBoundedResponseText(response, { maxBytes } = {}) {
   if (!response.body?.getReader) {
     throw new Error("Response body is not readable");
   }
-  if (!Number.isInteger(maxBytes) || maxBytes < 1 || !Number.isInteger(maxChars) || maxChars < 1) {
-    throw new Error("Response body limits are invalid");
+  if (!Number.isInteger(maxBytes) || maxBytes < 1) {
+    throw new Error("Response body limit is invalid");
   }
   const reader = response.body.getReader();
   const decoder = new TextDecoder();
@@ -880,18 +880,12 @@ async function readBoundedResponseText(response, { maxBytes, maxChars } = {}) {
       } else {
         bytesRead += value.byteLength;
         text += decoder.decode(value, { stream: true });
-        truncated = text.length > maxChars;
       }
     }
-    return {
-      text: text.slice(0, maxChars),
-      truncated: truncated || text.length > maxChars
-    };
+    return { text, truncated };
   } finally {
-    if (!reachedEnd) {
-      void reader.cancel().catch(() => {
-      });
-    }
+    if (!reachedEnd) void reader.cancel().catch(() => {
+    });
   }
 }
 
@@ -912,7 +906,6 @@ var RULE_BUNDLE_PROPERTIES = /* @__PURE__ */ new Set([
   "rules"
 ]);
 var RULE_BUNDLE_SCHEMA = "clicknix.rules.v1";
-var RFC3339_DATE_TIME = /^(\d{4})-(\d{2})-(\d{2})[Tt](\d{2}):(\d{2}):(\d{2})(?:\.\d+)?(?:[Zz]|([+-])(\d{2}):(\d{2}))$/;
 async function validateRuleBundle(bundle, {
   expectedSchema = RULE_BUNDLE_SCHEMA,
   maxSourceBytes = MAX_RULE_SOURCE_BYTES
@@ -933,7 +926,7 @@ async function validateRuleBundle(bundle, {
   if (typeof bundle.rulesVersion !== "string" || bundle.rulesVersion.length === 0 || bundle.rulesVersion.length > 128) {
     throw new Error("Rule bundle has an invalid version");
   }
-  if (typeof bundle.generatedAt !== "string" || !isRFC3339DateTime(bundle.generatedAt)) {
+  if (typeof bundle.generatedAt !== "string" || bundle.generatedAt.length === 0) {
     throw new Error("Rule bundle has an invalid generation timestamp");
   }
   if (!Number.isInteger(bundle.ruleCount) || bundle.ruleCount < 1) {
@@ -964,44 +957,6 @@ async function validateRuleBundle(bundle, {
     rules: bundle.rules
   };
 }
-function isRFC3339DateTime(value) {
-  const match = value.match(RFC3339_DATE_TIME);
-  if (!match) {
-    return false;
-  }
-  const year = Number(match[1]);
-  const month = Number(match[2]);
-  const day = Number(match[3]);
-  const hour = Number(match[4]);
-  const minute = Number(match[5]);
-  const second = Number(match[6]);
-  const offsetSign = match[7];
-  const offsetHour = match[8] === void 0 ? 0 : Number(match[8]);
-  const offsetMinute = match[9] === void 0 ? 0 : Number(match[9]);
-  const leapYear = year % 4 === 0 && (year % 100 !== 0 || year % 400 === 0);
-  const daysPerMonth = [31, leapYear ? 29 : 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31];
-  const daysInMonth = daysPerMonth[month - 1];
-  return month >= 1 && month <= 12 && day >= 1 && day <= daysInMonth && hour <= 23 && minute <= 59 && offsetHour <= 23 && offsetMinute <= 59 && (second <= 59 || second === 60 && isValidLeapSecond({ year, month, day, hour, minute, offsetSign, offsetHour, offsetMinute }));
-}
-function isValidLeapSecond({
-  year,
-  month,
-  day,
-  hour,
-  minute,
-  offsetSign,
-  offsetHour,
-  offsetMinute
-}) {
-  const localTime = /* @__PURE__ */ new Date(0);
-  localTime.setUTCFullYear(year, month - 1, day);
-  localTime.setUTCHours(hour, minute, 59, 0);
-  const offsetDirection = offsetSign === "-" ? -1 : 1;
-  const offsetMilliseconds = offsetDirection * (offsetHour * 60 + offsetMinute) * 60 * 1e3;
-  const utcTime = new Date(localTime.getTime() - offsetMilliseconds);
-  const expectedDay = utcTime.getUTCMonth() === 5 ? 30 : utcTime.getUTCMonth() === 11 ? 31 : void 0;
-  return utcTime.getUTCDate() === expectedDay && utcTime.getUTCHours() === 23 && utcTime.getUTCMinutes() === 59 && utcTime.getUTCSeconds() === 59;
-}
 
 // src/rules-loader-bundled.js
 async function loadRuleBundle() {
@@ -1013,8 +968,7 @@ async function loadRuleBundle() {
     throw new Error("Bundled rule bundle is unavailable");
   }
   const body = await readBoundedResponseText(response, {
-    maxBytes: MAX_RULE_BUNDLE_BYTES,
-    maxChars: MAX_RULE_BUNDLE_BYTES
+    maxBytes: MAX_RULE_BUNDLE_BYTES
   });
   if (body.truncated) {
     throw new Error("Bundled rule bundle exceeds the size limit");
@@ -1036,6 +990,7 @@ var SCANNER_WORKER_MESSAGES = Object.freeze({
   INITIALIZATION_FAILED: "initialization-failed",
   SCAN: "scan",
   SCAN_FAILED: "scan-failed",
+  SCAN_PROGRESS: "scan-progress",
   SCAN_RESULT: "scan-result"
 });
 var SCANNER_FAILURE_CODES = Object.freeze({
@@ -1073,23 +1028,12 @@ function createScannerFailure({
 
 // src/scanner-worker.js
 var runtime;
-var scannerState = "initializing";
-var terminalFailure;
 void initializeScanner();
 self.addEventListener("message", (event) => {
   if (event.data?.type !== SCANNER_WORKER_MESSAGES.SCAN) {
     return;
   }
   const { requestId, payload, lengths } = event.data;
-  if (scannerState !== "ready") {
-    postScanFailure(requestId, terminalFailure || createScannerFailure({
-      code: SCANNER_FAILURE_CODES.INITIALIZATION_FAILED,
-      stage: "initialization",
-      message: "YARA-X scanner initialization is still in progress",
-      terminal: false
-    }));
-    return;
-  }
   if (!(payload instanceof ArrayBuffer) || !packsPayload(lengths, payload.byteLength)) {
     postScanFailure(requestId, createScannerFailure({
       code: SCANNER_FAILURE_CODES.INVALID_REQUEST,
@@ -1100,11 +1044,14 @@ self.addEventListener("message", (event) => {
   }
   const results = [];
   let offset = 0;
-  for (const length of lengths) {
+  for (const [bufferIndex, length] of lengths.entries()) {
+    if (lengths.length > 1) {
+      self.postMessage({ type: SCANNER_WORKER_MESSAGES.SCAN_PROGRESS, requestId, bufferIndex });
+    }
     const result = scanBuffer(new Uint8Array(payload, offset, length));
     offset += length;
     if (result.failure?.terminal) {
-      postScanFailure(requestId, result.failure);
+      postScanFailure(requestId, { ...result.failure, bufferIndex });
       return;
     }
     results.push(result);
@@ -1151,11 +1098,7 @@ function scanBuffer(bytes) {
     };
   }
   try {
-    return {
-      matches: result.matches.map(normalizeMatch),
-      // Compile warnings are logged once at load; keep only scan-time warnings.
-      warnings: [...result.warnings || []].filter((warning) => !runtime.compileWarnings.has(warning))
-    };
+    return { matches: result.matches.map(normalizeMatch) };
   } catch (error) {
     return {
       failure: createScannerFailure({
@@ -1169,22 +1112,19 @@ function scanBuffer(bytes) {
 async function initializeScanner() {
   try {
     runtime = await createRuntime();
-    scannerState = "ready";
     self.postMessage({
       type: SCANNER_WORKER_MESSAGES.INITIALIZED,
       runtime: runtimeMetadata(runtime)
     });
   } catch (error) {
-    scannerState = "failed";
-    terminalFailure = createScannerFailure({
-      code: SCANNER_FAILURE_CODES.INITIALIZATION_FAILED,
-      stage: "initialization",
-      message: errorDetail(error),
-      terminal: true
-    });
     self.postMessage({
       type: SCANNER_WORKER_MESSAGES.INITIALIZATION_FAILED,
-      failure: terminalFailure
+      failure: createScannerFailure({
+        code: SCANNER_FAILURE_CODES.INITIALIZATION_FAILED,
+        stage: "initialization",
+        message: errorDetail(error),
+        terminal: true
+      })
     });
   }
 }
@@ -1221,8 +1161,7 @@ async function createRuntime() {
     } catch (error) {
       throw new Error(`YARA-X rule build failed: ${errorDetail(error)}`);
     }
-    const compileWarnings = new Set(rules.warnings || []);
-    return { bundle, scanner: rules.scanner(), compileWarnings };
+    return { bundle, scanner: rules.scanner() };
   } finally {
     compiler.free();
   }

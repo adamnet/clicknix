@@ -1,6 +1,38 @@
 (() => {
+  // src/activation.js
+  function whenActivated(start) {
+    if (!document.prerendering) {
+      start();
+      return;
+    }
+    const activated = () => {
+      if (document.prerendering) return;
+      observer.disconnect();
+      document.removeEventListener("prerenderingchange", activated);
+      chrome.runtime.onMessage.removeListener(handleMessage);
+      start();
+    };
+    const handleMessage = (message) => {
+      if (message?.type === "start-document") activated();
+      return false;
+    };
+    const listen = () => document.addEventListener("prerenderingchange", activated);
+    const observer = new MutationObserver(listen);
+    observer.observe(document, { childList: true });
+    listen();
+    chrome.runtime.onMessage.addListener(handleMessage);
+  }
+
   // src/clipboard-command.js
-  var LAUNCHER = /^\s*["'`]?\s*(?:start\s+(?:\/\w+\s+)*)?(?:(?:cmd(?:\.exe)?|%comspec%)\s+\/[ck]\s+)?(?:sudo\s+(?:-\S+\s+)*)?["']?(?:(?:[a-z]:|%\w+%)?[\\/][\w\\/.%() -]*[\\/])?(?:(?:powershell|pwsh|mshta|conhost|msiexec|rundll32|regsvr32|wscript|cscript|bitsadmin|certutil|forfiles|finger|cmd|curl|wget|bash|zsh|sh|osascript|echo|iwr|irm|iex|invoke-webrequest|invoke-restmethod|invoke-expression)(?:\.exe)?\b|%comspec%)/i;
+  var LAUNCHER_LEAD = /\s*["'`]?\s*/y;
+  var START = /start\s+/iy;
+  var CMD_SCRIPT = /(?:cmd(?:\.exe)?|%comspec%)\s+\/[ck]\s+/iy;
+  var SUDO = /sudo\s+/iy;
+  var LAUNCHER = /["']?(?:(?:[a-z]:|%\w+%)?[\\/][\w\\/.%() -]*[\\/])?(?:(?:powershell|pwsh|mshta|conhost|msiexec|rundll32|regsvr32|wscript|cscript|bitsadmin|certutil|forfiles|finger|cmd|curl|wget|bash|zsh|sh|osascript|echo|iwr|irm|iex|invoke-webrequest|invoke-restmethod|invoke-expression)(?:\.exe)?\b|%comspec%)/iy;
+  var DASH_OPTION = /-\S+\s+/y;
+  var SLASH_OPTION = /\/\w+(\s+)/y;
+  var BLANKS = /\s+/y;
+  var LEADING_BLANKS = /\s*/y;
   var DISGUISE = /(?:(?:^|[\s;])<?#|(?:^|[&|(]\s*)(?:rem\b|::))[^\n]{0,200}?(?:robot|captcha|veri?f|human|ray\s*id|cloudflare|security\s+check|\u2705|\u2714)/i;
   var PADDING = /\S[\p{Zs}\t\u2800]{40}[\p{Zs}\t]*\S/u;
   var ESCAPE = /\^([^])|`([^`])/g;
@@ -11,30 +43,42 @@
   );
   var NUMERIC_HIDDEN_WINDOWS = new RegExp(String.raw`${WINDOW_OPTION}[12](?![\w.])`, "gi");
   var COMMAND_BREAKS = /[|&;\n]|(?<=\s\/[ck])\s+["']?|(?<=\s-c)\s+["']/gi;
-  var WAIT_OPTION_COMMAND = /\s*(?:(?:start(?=((?:\s+"[^"\n]*")?))\1(?:\s+\/\w+)*|sudo|(?:cmd(?:\.exe)?|%comspec%)\s+\/[ck])\s+)*["']?(?:[\w:.%\\/-]*[\\/])?(?:ping|nc|ncat|netcat|curl|wget|timeout|grep)(?:\.exe)?(?=[\s"']|$)/iy;
+  var WAIT_PREFIX = /(start)(?=((?:\s+"[^"\n]*")?))\2|sudo|(?:cmd(?:\.exe)?|%comspec%)\s+\/[ck]/iy;
+  var WAIT_OPTION_TOOL = /["']?(?:[\w:.%\\/-]*[\\/])?(?:ping|nc|ncat|netcat|curl|wget|timeout|grep)(?:\.exe)?(?=[\s"']|$)/iy;
+  var START_SWITCH = /\/\w+/y;
   var POWERSHELL = /\b(?:powershell|pwsh)\b/i;
   var ENCODED = /(?:^|\s)[-/\u2013\u2014\u2015]e(?:c|n(?:c(?:o(?:d(?:e(?:d(?:c(?:o(?:m(?:m(?:a(?:n(?:d)?)?)?)?)?)?)?)?)?)?)?)?)?\s+["']?[a-z0-9+/=]{20,}|frombase64string|\bbase64\s+(?:-d|--decode|-D)\b/i;
   var REMOTE_SCRIPT_LOADER = /\bmshta(?:\.exe)?["']?\s+["']?(?:https?:|\\\\)|\brundll32(?:\.exe)?["']?\s+["']?\\\\|\/i:["']?(?:https?:|\\\\)|\bscrobj\b/i;
   var DOWNLOAD = /\b(?:iwr|irm|invoke-webrequest|invoke-restmethod|downloadstring|downloadfile|webclient|start-bitstransfer|bitsadmin|curl|wget|finger)\b|-urlcache\b/i;
-  var EXECUTE = /\b(?:iex|invoke-expression|start-process)\b|\[scriptblock\]::create\b|\|\s*(?:(?:sudo|nohup|env|exec|command)\s+(?:-\S+\s+)*){0,3}(?:(?:ba|z)?sh|powershell|pwsh|cmd|python[\d.]*|perl|ruby|node|osascript)\b|&\s*\(|(?:^|[|;(])\s*\.\s*\(|[$<]\(\s*(?:curl|wget)\b|\bchmod\s+\+x\b|(?:&&?|;)\s*(?:(?:start|call)\b|(?:sudo\s+)?(?:(?:ba|z)?sh|source|\.)\s+\S|[.~]?\/\S|["']?[^\s&|;"']*\.(?:exe|bat|cmd|com|ps1|vbs|js|hta|msi|scr)\b)/i;
-  var REMOTE_INSTALL = /\bmsiexec(?:\.exe)?["']?\s+(?:\/\w+\s+)*\/i\s*["']?(?:https?:|\\\\)/i;
+  var PIPED_PATH = String.raw`(?:[a-z]:|%\w+%)?[\\/][\w\\/.%()-]*[\\/]`;
+  var PIPED_INTERPRETER = String.raw`(?:(?:ba|z)?sh|powershell|pwsh|cmd|python[\d.]*|perl|ruby|node|osascript)`;
+  var PIPE = /\|\s*/g;
+  var PIPED_WRAPPER = new RegExp(String.raw`(?:${PIPED_PATH})?(?:sudo|nohup|env|exec|command)\s+`, "iy");
+  var PIPED_PROGRAM = new RegExp(
+    String.raw`${PIPED_INTERPRETER}\b|${PIPED_PATH}${PIPED_INTERPRETER}(?:\.exe)?(?![\w\\/.-])`,
+    "iy"
+  );
+  var EXECUTE = new RegExp(
+    String.raw`\b(?:iex|invoke-expression|start-process)\b|\[scriptblock\]::create\b|` + String.raw`&\s*\(|(?:^|[|;(])\s*\.\s*\(|[$<]\(\s*(?:curl|wget)\b|\bchmod\s+\+x\b|` + String.raw`(?:&&?|;)\s*(?:(?:start|call)\b|(?:sudo\s+)?(?:(?:ba|z)?sh|source|\.)\s+\S|[.~]?\/\S|["']?[^\s&|;"']*\.(?:exe|bat|cmd|com|ps1|vbs|js|hta|msi|scr)\b)`,
+    "i"
+  );
+  var MSIEXEC = /\bmsiexec(?:\.exe)?["']?\s+/gi;
+  var REMOTE_INSTALL_OPTION = /\/(?:i|package)\s*["']?(?:https?:|\\\\)/iy;
   var SCRIPT_HOST = /\b(?:powershell|pwsh|mshta|wscript|cscript|rundll32|regsvr32|conhost)\b/i;
   var CLIPBOARD_NOTICE_MESSAGE = "clipboard-notice";
   var CLIPBOARD_COMMAND = Object.freeze({
-    // Disguised, hidden, encoded or remote-loader command: the ClickFix pattern.
     SCAM: "scam",
-    // A command that downloads and runs code, like many installer one-liners.
     DOWNLOAD_EXECUTE: "download-execute"
   });
   function classifyClipboardCommand(text) {
     if (typeof text !== "string") return null;
     const command = text.replace(ESCAPE, "$1$2");
-    if (!LAUNCHER.test(command)) return null;
+    if (!startsLikeCommand(command)) return null;
     if (hidesWindow(command) || ENCODED.test(command) || REMOTE_SCRIPT_LOADER.test(command)) {
       return CLIPBOARD_COMMAND.SCAM;
     }
-    const remoteInstall = REMOTE_INSTALL.test(command);
-    const runsCode = remoteInstall || EXECUTE.test(command);
+    const remoteInstall = installsRemotely(command);
+    const runsCode = remoteInstall || EXECUTE.test(command) || pipesIntoInterpreter(command);
     if ((DISGUISE.test(command) || PADDING.test(text)) && (runsCode || SCRIPT_HOST.test(command))) {
       return CLIPBOARD_COMMAND.SCAM;
     }
@@ -57,13 +101,80 @@
         owned = null;
         nextBreak = COMMAND_BREAKS.exec(command);
       }
-      if (owned === null) {
-        WAIT_OPTION_COMMAND.lastIndex = start;
-        owned = WAIT_OPTION_COMMAND.test(command);
-      }
+      if (owned === null) owned = startsWaitOptionTool(command, start);
       if (!owned) return true;
     }
     return false;
+  }
+  function matchesAt(pattern, text, index) {
+    pattern.lastIndex = index;
+    return pattern.test(text);
+  }
+  function startsLikeCommand(command) {
+    matchesAt(LAUNCHER_LEAD, command, 0);
+    let index = LAUNCHER_LEAD.lastIndex;
+    if (!matchesAt(START, command, index)) return launchesFrom(command, index);
+    index = START.lastIndex;
+    for (let pathStart = true; ; ) {
+      SLASH_OPTION.lastIndex = index;
+      const option = SLASH_OPTION.exec(command);
+      if (!option) return launchesFrom(command, index);
+      if (pathStart && matchesAt(LAUNCHER, command, index)) return true;
+      pathStart = /[^ ]/.test(option[1]);
+      index = SLASH_OPTION.lastIndex;
+    }
+  }
+  function launchesFrom(command, index) {
+    const scripted = matchesAt(CMD_SCRIPT, command, index) && launchesBehindSudo(command, CMD_SCRIPT.lastIndex);
+    return scripted || launchesBehindSudo(command, index);
+  }
+  function launchesBehindSudo(command, index) {
+    if (matchesAt(SUDO, command, index)) index = skipOptions(command, SUDO.lastIndex);
+    return matchesAt(LAUNCHER, command, index);
+  }
+  function skipOptions(command, index) {
+    while (matchesAt(DASH_OPTION, command, index)) index = DASH_OPTION.lastIndex;
+    return index;
+  }
+  function pipesIntoInterpreter(command) {
+    for (const pipe of command.matchAll(PIPE)) {
+      let index = pipe.index + pipe[0].length;
+      for (let wrappers = 3; ; wrappers--) {
+        if (matchesAt(PIPED_PROGRAM, command, index)) return true;
+        if (wrappers === 0 || !matchesAt(PIPED_WRAPPER, command, index)) break;
+        index = skipOptions(command, PIPED_WRAPPER.lastIndex);
+      }
+    }
+    return false;
+  }
+  function installsRemotely(command) {
+    for (const msiexec of command.matchAll(MSIEXEC)) {
+      let index = msiexec.index + msiexec[0].length;
+      for (; ; ) {
+        if (matchesAt(REMOTE_INSTALL_OPTION, command, index)) return true;
+        if (!matchesAt(SLASH_OPTION, command, index)) break;
+        index = SLASH_OPTION.lastIndex;
+      }
+    }
+    return false;
+  }
+  function startsWaitOptionTool(command, start) {
+    matchesAt(LEADING_BLANKS, command, start);
+    let index = LEADING_BLANKS.lastIndex;
+    for (; ; ) {
+      if (matchesAt(WAIT_OPTION_TOOL, command, index)) return true;
+      WAIT_PREFIX.lastIndex = index;
+      const prefix = WAIT_PREFIX.exec(command);
+      if (!prefix) return false;
+      index = WAIT_PREFIX.lastIndex;
+      for (; ; ) {
+        if (!matchesAt(BLANKS, command, index)) return false;
+        index = BLANKS.lastIndex;
+        if (!prefix[1] || !matchesAt(START_SWITCH, command, index)) break;
+        if (matchesAt(WAIT_OPTION_TOOL, command, index)) return true;
+        index = START_SWITCH.lastIndex;
+      }
+    }
   }
 
   // icons/logo-notice.png
@@ -204,10 +315,17 @@
   var SHADOW_ROOT_EVENT_GLOBAL = "clickNixShadowRootEvent";
   var BLOB_SCRIPT_GLOBAL = "clickNixBlobScript";
   var popupClipboardEventType = (handshakeId) => `clicknix-popup-clipboard-${handshakeId}`;
-  var PICTURE_IN_PICTURE_QUERY = "(display-mode: picture-in-picture)";
+  var PAGE_HOOK_READY = "clicknix-page-hook-ready";
+  var PAGE_HOOK_RESPONSE = "clicknix-response-body";
+  var PAGE_HOOK_CLIPBOARD = "clicknix-clipboard-text";
+  var PAGE_HOOK_SCRIPT_URL = "clicknix-script-url";
+  var PAGE_HOOK_ACK = "clicknix-page-hook-ack";
+  var PAGE_HOOK_STOP = "clicknix-page-hook-stop";
+  var PAGE_HOOK_BLOB_SCRIPT = "clicknix-blob-script";
 
   // src/runtime-message.js
   var pending = /* @__PURE__ */ new Set();
+  var pictureInPicture = matchMedia("(display-mode: picture-in-picture)");
   chrome.runtime.onMessage.addListener((message) => {
     if (message?.type === "rescan-document") {
       for (const resolve of pending) resolve(null);
@@ -215,58 +333,78 @@
     }
     return false;
   });
-  function sendRuntimeMessage(message) {
-    return new Promise((resolve, reject) => {
-      const sent = chrome.runtime.sendMessage(message);
-      pending.add(resolve);
-      sent.then(resolve, reject).finally(() => pending.delete(resolve));
-    });
-  }
-  function isExtensionContextInvalidated(error) {
-    return error instanceof Error && error.message.includes("Extension context invalidated");
-  }
-
-  // src/scan-response.js
-  function wasScanAttempted(response) {
-    return response !== null && response !== void 0 && response.result?.stale !== true;
+  function createMessageSender(onInvalidated) {
+    return async (message) => {
+      try {
+        return await new Promise((resolve, reject) => {
+          const sent = chrome.runtime.sendMessage({ ...message, pictureInPicture: pictureInPicture.matches });
+          pending.add(resolve);
+          sent.then(resolve, reject).finally(() => pending.delete(resolve));
+        });
+      } catch (error) {
+        if (error instanceof Error && error.message.includes("Extension context invalidated")) {
+          onInvalidated();
+        }
+        return null;
+      }
+    };
   }
 
   // src/scan-window.js
-  var charCodeAt = Function.prototype.call.bind(String.prototype.charCodeAt);
+  var call = Function.prototype.call;
+  var charCodeAt = call.bind(String.prototype.charCodeAt);
+  var slice = call.bind(String.prototype.slice);
+  var exec = call.bind(RegExp.prototype.exec);
+  var NON_ASCII = /[^\0-\x7f]/g;
+  var ASCII_RUN_SEARCH = 16;
   function fitWindow(text, maxChars, maxBytes, start = 0) {
-    const end = text.length - start < maxChars ? text.length : start + maxChars;
-    let index = start;
+    const segment = slice(text, start, text.length - start < maxChars ? text.length : start + maxChars);
+    let index = 0;
     let bytes = 0;
-    while (index < end) {
-      const code = charCodeAt(text, index);
+    let ascii = 0;
+    while (index < segment.length) {
+      const code = charCodeAt(segment, index);
       let units = 1;
       let size = 3;
       if (code < 128) {
+        if (++ascii === ASCII_RUN_SEARCH) {
+          NON_ASCII.lastIndex = index;
+          const run = (exec(NON_ASCII, segment)?.index ?? segment.length) - index;
+          if (bytes + run > maxBytes) {
+            index += maxBytes - bytes;
+            bytes = maxBytes;
+            break;
+          }
+          index += run;
+          bytes += run;
+          continue;
+        }
         size = 1;
-      } else if (code < 2048) {
-        size = 2;
-      } else if (code >= 55296 && code <= 56319) {
-        const next = charCodeAt(text, index + 1);
-        if (next >= 56320 && next <= 57343) {
-          units = 2;
-          size = 4;
+      } else {
+        ascii = 0;
+        if (code < 2048) {
+          size = 2;
+        } else if (code >= 55296 && code <= 56319) {
+          const next = charCodeAt(text, start + index + 1);
+          if (next >= 56320 && next <= 57343) {
+            units = 2;
+            size = 4;
+          }
         }
       }
-      if (index + units > end || bytes + size > maxBytes) break;
+      if (index + units > segment.length || bytes + size > maxBytes) break;
       index += units;
       bytes += size;
     }
-    return { chars: index - start, bytes };
+    return { chars: index, bytes };
   }
   function utf8Length(text) {
     return fitWindow(text, text.length, Infinity).bytes;
   }
   var TextWindows = class {
     #text = "";
-    // Where the unfinished window starts in #text, and its UTF-8 size.
     #start = 0;
     #bytes = 0;
-    // Adds text and returns the windows it completed.
     push(text) {
       this.#text = this.#text.slice(this.#start) + text;
       this.#start = 0;
@@ -281,7 +419,6 @@
       }
       return windows;
     }
-    // Returns the last window, if any text is left.
     end() {
       const text = this.#text.slice(this.#start);
       this.#text = "";
@@ -292,32 +429,15 @@
   };
 
   // src/bridge.js
-  var PAGE_HOOK_RESPONSE = "clicknix-response-body";
-  var PAGE_HOOK_CLIPBOARD = "clicknix-clipboard-text";
-  var PAGE_HOOK_SCRIPT_URL = "clicknix-script-url";
   var CAPTURE_RESOURCE_TYPES = /* @__PURE__ */ new Set(["Fetch", "XHR", "Blob", "Message", "Eval", "Style", "Popup"]);
-  var PAGE_HOOK_ACK = "clicknix-page-hook-ack";
-  var PAGE_HOOK_READY = "clicknix-page-hook-ready";
-  var PAGE_HOOK_STOP = "clicknix-page-hook-stop";
-  var PAGE_HOOK_BLOB_SCRIPT = "clicknix-blob-script";
   var stopImmediatePropagation = Event.prototype.stopImmediatePropagation;
-  var pictureInPicture = matchMedia(PICTURE_IN_PICTURE_QUERY);
   var stopped = false;
   var port;
-  var MAX_OUTSTANDING_SCRIPT_URLS = 4;
-  var scriptURLQueue = [];
-  var outstandingScriptURLs = 0;
-  async function sendRuntimeMessage2(message) {
-    try {
-      return await sendRuntimeMessage({
-        ...message,
-        pictureInPicture: pictureInPicture.matches
-      });
-    } catch (error) {
-      if (isExtensionContextInvalidated(error)) stopPageHook();
-      return void 0;
-    }
-  }
+  var MAX_SENT_CHARS = 4 * MAX_CAPTURE_CHARS;
+  var unsentCaptures = [];
+  var sentChars = 0;
+  var activation = new Promise((resolve) => whenActivated(resolve));
+  var sendRuntimeMessage = createMessageSender(stopPageHook);
   function stopPageHook() {
     if (stopped) return;
     stopped = true;
@@ -355,22 +475,12 @@
     const kind = classifyClipboardCommand(event.data);
     if (kind && event.source) showClipboardNotice(kind, event.source);
   }
-  function sendScriptURLs() {
-    while (outstandingScriptURLs < MAX_OUTSTANDING_SCRIPT_URLS && scriptURLQueue.length > 0) {
-      outstandingScriptURLs += 1;
-      void sendRuntimeMessage2({ type: "scan-script-url", url: scriptURLQueue.shift() }).then(() => {
-        outstandingScriptURLs -= 1;
-        sendScriptURLs();
-      });
-    }
-  }
   function handlePageHookMessage(event) {
     const data = event.data;
     if (stopped || !event.isTrusted) return;
     if (data?.type === PAGE_HOOK_SCRIPT_URL) {
-      if (typeof data.url === "string") {
-        scriptURLQueue.push(data.url);
-        sendScriptURLs();
+      if (typeof data.url === "string" && /^https?:/i.test(data.url)) {
+        void activation.then(() => sendRuntimeMessage({ type: "scan-script-url", url: data.url }));
       }
       return;
     }
@@ -381,29 +491,41 @@
       if (window.top === window) {
         showClipboardNotice(kind);
       } else {
-        void sendRuntimeMessage2({ type: CLIPBOARD_NOTICE_MESSAGE, kind });
+        void sendRuntimeMessage({ type: CLIPBOARD_NOTICE_MESSAGE, kind });
       }
       return;
     }
     if (!Number.isSafeInteger(data.messageId)) return;
     if (data.type === PAGE_HOOK_RESPONSE && typeof data.url === "string" && CAPTURE_RESOURCE_TYPES.has(data.resourceType)) {
-      void forwardCapture(data.messageId, {
-        type: data.resourceType === "Popup" ? "scan-popup-document" : "scan-response-body",
-        url: data.url,
-        resourceType: data.resourceType
-      }, data.text);
+      unsentCaptures.push({
+        messageId: data.messageId,
+        message: {
+          type: data.resourceType === "Popup" ? "scan-popup-document" : "scan-response-body",
+          url: data.url,
+          resourceType: data.resourceType
+        },
+        text: data.text
+      });
+      void activation.then(sendCaptures);
     }
   }
-  async function forwardCapture(messageId, message, text) {
+  function sendCaptures() {
+    while (unsentCaptures.length > 0 && (sentChars === 0 || sentChars + unsentCaptures[0].text.length <= MAX_SENT_CHARS)) {
+      const capture = unsentCaptures.shift();
+      sentChars += capture.text.length;
+      void forwardCapture(capture).then(() => {
+        sentChars -= capture.text.length;
+        sendCaptures();
+      });
+    }
+  }
+  async function forwardCapture({ messageId, message, text }) {
     const windows = new TextWindows();
-    const payloads = [...windows.push(text), ...windows.end()];
-    let scanned = true;
-    for (const payload of payloads) {
-      const response = await sendRuntimeMessage2({ ...message, payload });
-      scanned = wasScanAttempted(response) && scanned;
+    for (const payload of [...windows.push(text), ...windows.end()]) {
+      await sendRuntimeMessage({ ...message, payload });
     }
     if (!stopped) {
-      port.postMessage({ type: PAGE_HOOK_ACK, messageId, scanned });
+      port.postMessage({ type: PAGE_HOOK_ACK, messageId });
     }
   }
 })();

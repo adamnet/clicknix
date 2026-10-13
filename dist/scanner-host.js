@@ -12,6 +12,7 @@ var SCANNER_WORKER_MESSAGES = Object.freeze({
   INITIALIZATION_FAILED: "initialization-failed",
   SCAN: "scan",
   SCAN_FAILED: "scan-failed",
+  SCAN_PROGRESS: "scan-progress",
   SCAN_RESULT: "scan-result"
 });
 var SCANNER_FAILURE_CODES = Object.freeze({
@@ -134,7 +135,8 @@ function stopWorker(failure) {
   worker = void 0;
   scannerStatus = failedStatus(failure);
   settleInitialization({ ok: false, failure });
-  takeActiveScan()?.reject(failureError(failure));
+  const pending = takeActiveScan();
+  pending?.reject(failureError(pending.bufferIndex === void 0 || failure.bufferIndex !== void 0 ? failure : { ...failure, bufferIndex: pending.bufferIndex }));
 }
 function handleWorkerMessage(event) {
   const message = event.data;
@@ -151,6 +153,12 @@ function handleWorkerMessage(event) {
       message: "YARA-X scanner initialization failed",
       terminal: true
     }));
+    return;
+  }
+  if (message?.type === SCANNER_WORKER_MESSAGES.SCAN_PROGRESS) {
+    if (message.requestId === activeScan?.requestId && Number.isInteger(message.bufferIndex)) {
+      activeScan.bufferIndex = message.bufferIndex;
+    }
     return;
   }
   if (message?.type !== SCANNER_WORKER_MESSAGES.SCAN_RESULT && message?.type !== SCANNER_WORKER_MESSAGES.SCAN_FAILED) {
@@ -178,6 +186,7 @@ function handleWorkerMessage(event) {
 }
 async function handleRequest(message) {
   if (message.type === SCANNER_REQUESTS.INITIALIZE) {
+    deliveredPayload = void 0;
     if (activeScan) {
       stopWorker(createScannerFailure({
         code: SCANNER_FAILURE_CODES.WORKER_UNAVAILABLE,

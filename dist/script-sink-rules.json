@@ -19,7 +19,8 @@
     "condition": {
       "resourceTypes": ["main_frame", "sub_frame", "object"],
       "excludedResponseHeaders": [
-        { "header": "content-security-policy", "values": ["*trusted-types*"] }
+        { "header": "content-security-policy", "values": ["*trusted-types*"] },
+        { "header": "content-type", "values": ["application/pdf*"] }
       ]
     }
   }

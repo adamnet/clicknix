@@ -8,43 +8,64 @@
   var SCAN_WINDOW_OVERLAP_CHARS = 64 * 1024;
   var shadowRootEventType = (handshakeId2) => `clicknix-attach-shadow-${handshakeId2}`;
   var popupClipboardEventType = (handshakeId2) => `clicknix-popup-clipboard-${handshakeId2}`;
-
-  // src/scan-window.js
-  var charCodeAt = Function.prototype.call.bind(String.prototype.charCodeAt);
-  function fitWindow(text, maxChars, maxBytes, start = 0) {
-    const end = text.length - start < maxChars ? text.length : start + maxChars;
-    let index = start;
-    let bytes = 0;
-    while (index < end) {
-      const code = charCodeAt(text, index);
-      let units = 1;
-      let size = 3;
-      if (code < 128) {
-        size = 1;
-      } else if (code < 2048) {
-        size = 2;
-      } else if (code >= 55296 && code <= 56319) {
-        const next = charCodeAt(text, index + 1);
-        if (next >= 56320 && next <= 57343) {
-          units = 2;
-          size = 4;
-        }
-      }
-      if (index + units > end || bytes + size > maxBytes) break;
-      index += units;
-      bytes += size;
-    }
-    return { chars: index - start, bytes };
-  }
-
-  // src/page-hook.js
+  var PAGE_HOOK_READY = "clicknix-page-hook-ready";
   var PAGE_HOOK_RESPONSE = "clicknix-response-body";
   var PAGE_HOOK_CLIPBOARD = "clicknix-clipboard-text";
   var PAGE_HOOK_SCRIPT_URL = "clicknix-script-url";
   var PAGE_HOOK_ACK = "clicknix-page-hook-ack";
-  var PAGE_HOOK_READY = "clicknix-page-hook-ready";
   var PAGE_HOOK_STOP = "clicknix-page-hook-stop";
   var PAGE_HOOK_BLOB_SCRIPT = "clicknix-blob-script";
+
+  // src/scan-window.js
+  var call = Function.prototype.call;
+  var charCodeAt = call.bind(String.prototype.charCodeAt);
+  var slice = call.bind(String.prototype.slice);
+  var exec = call.bind(RegExp.prototype.exec);
+  var NON_ASCII = /[^\0-\x7f]/g;
+  var ASCII_RUN_SEARCH = 16;
+  function fitWindow(text, maxChars, maxBytes, start = 0) {
+    const segment = slice(text, start, text.length - start < maxChars ? text.length : start + maxChars);
+    let index = 0;
+    let bytes = 0;
+    let ascii = 0;
+    while (index < segment.length) {
+      const code = charCodeAt(segment, index);
+      let units = 1;
+      let size = 3;
+      if (code < 128) {
+        if (++ascii === ASCII_RUN_SEARCH) {
+          NON_ASCII.lastIndex = index;
+          const run = (exec(NON_ASCII, segment)?.index ?? segment.length) - index;
+          if (bytes + run > maxBytes) {
+            index += maxBytes - bytes;
+            bytes = maxBytes;
+            break;
+          }
+          index += run;
+          bytes += run;
+          continue;
+        }
+        size = 1;
+      } else {
+        ascii = 0;
+        if (code < 2048) {
+          size = 2;
+        } else if (code >= 55296 && code <= 56319) {
+          const next = charCodeAt(text, start + index + 1);
+          if (next >= 56320 && next <= 57343) {
+            units = 2;
+            size = 4;
+          }
+        }
+      }
+      if (index + units > segment.length || bytes + size > maxBytes) break;
+      index += units;
+      bytes += size;
+    }
+    return { chars: index, bytes };
+  }
+
+  // src/page-hook.js
   var HOOK_KEY = "__clickNixPageHook";
   var SHADOW_ROOT_KEY = "__clickNixShadowRoot";
   var {
@@ -229,20 +250,13 @@
   );
   var CHARSET_PARAMETER = /;\s*charset\s*=\s*"?([^";\s]+)/i;
   var TEXT_URL_EXTENSION = /\.(?:css|html?|js|json|xml)(?:[?#]|$)/i;
-  var captureQueue = [];
   var handshakeId = [...crypto.getRandomValues(new Uint32Array(4))].map((part) => part.toString(16).padStart(8, "0")).join("");
   var popupClipboardEvent = popupClipboardEventType(handshakeId);
   var bridgePort;
   var captureStopped = false;
-  var MAX_ACTIVE_CAPTURES = 4;
   var READ_CHUNK_BYTES = 64 * 1024;
-  var CAPTURE_MEMORY_RESERVATION = MAX_CAPTURE_CHARS * 2 + READ_CHUNK_BYTES;
-  var CAPTURE_MEMORY_MINIMUM = (SCAN_WINDOW_OVERLAP_CHARS + READ_CHUNK_BYTES) * 2 + READ_CHUNK_BYTES;
-  var CAPTURE_MEMORY_LIMIT = MAX_ACTIVE_CAPTURES * CAPTURE_MEMORY_RESERVATION;
   var CAPTURE_FLUSH_MS = 100;
   var FLUSH_DUE = freeze({ __proto__: null });
-  var activeCaptures = 0;
-  var preferNewestCapture = true;
   var nextMessageId = 1;
   var pendingAcks = { __proto__: null };
   function hookFetch(realm, facadeOf) {
@@ -262,22 +276,21 @@
     if (captureStopped) return result;
     return new RealmPromise((resolve, reject) => {
       void settle(result, (response) => {
-        const admitted = () => resolve(response);
-        void settle(captureFetchResponse(response, realm), admitted, admitted);
+        resolve(response);
+        try {
+          captureFetchResponse(response, realm);
+        } catch {
+        }
       }, reject);
     });
   }
-  async function captureFetchResponse(response, realm) {
+  function captureFetchResponse(response, realm) {
     if (captureStopped || apply(responseBody, response, []) === null) {
       return;
     }
     const url = apply(responseURL, response, []) || realm.location.href;
     const contentType = apply(headersGet, apply(responseHeaders, response, []), ["content-type"]);
-    if (!isTextResponse(url, contentType)) {
-      return;
-    }
-    const admitted = startResponseCapture(response, url);
-    if (admitted) await admitted;
+    if (isTextResponse(url, contentType)) startResponseCapture(response, url);
   }
   function hookXHR(realm, facadeOf) {
     if (typeof realm.XMLHttpRequest !== "function") {
@@ -545,7 +558,8 @@
     return captureStopped || apply(weakSetHas, capturedBodies, [body]);
   }
   function bodyRead(text, url, resourceType, parse, realm, RealmPromise) {
-    const send = (part) => sendResponseWindow(url, resourceType, part);
+    const type = resourceType === "Fetch" ? "Fetch" : "Blob";
+    const send = (part) => sendResponseWindow(url, type, part);
     return new RealmPromise((resolve, reject) => {
       void settle(text, (value) => {
         void captureText(value, send);
@@ -610,24 +624,29 @@
     try {
       const head = new NativeUint8Array(8);
       let length = 0;
-      const source = new StreamBytes(apply(blobStream, apply(blobSlice, object, [0, 8]), []));
+      const source = new StreamBytes(apply(blobStream, apply(blobSlice, object, [0, 8]), []), true);
       try {
         while (length < 8) {
           await own(source.ready());
           const bytes = source.take(8 - length);
           if (bytes === null) break;
           const count = apply(typedArrayByteLength, bytes, []);
-          for (let index = 0; index < count; index += 1) head[length++] = bytes[index];
+          for (let index2 = 0; index2 < count; index2 += 1) head[length++] = bytes[index2];
         }
       } finally {
         source.cancel();
       }
       encoding = head[0] === 255 && head[1] === 254 ? "utf-16le" : head[0] === 254 && head[1] === 255 ? "utf-16be" : head[0] === 239 && head[1] === 187 && head[2] === 191 ? "utf-8" : encodingOf(apply(regExpExec, CHARSET_PARAMETER, [apply(blobType, object, [])])?.[1]);
       const text = apply(textDecode, new NativeTextDecoder(encoding ?? "utf-8"), [
-        new NativeUint8Array(apply(typedArrayBuffer, head, []), 0, length)
+        new NativeUint8Array(apply(typedArrayBuffer, head, []), 0, length),
+        { __proto__: null, stream: true }
       ]);
-      const code = apply(stringCharCodeAt, text, [0]);
-      script = !(text.length === 0 || code === 65533 || code < 32 && (code < 9 || code > 13));
+      let index = 0;
+      let code = apply(stringCharCodeAt, text, [0]);
+      while (code >= 48 && code <= 57 || (code | 32) >= 97 && (code | 32) <= 122) {
+        code = apply(stringCharCodeAt, text, [++index]);
+      }
+      script = !(text.length === 0 || index === 0 && code === 37 || code === 65533 || code < 32 && (code < 9 || code > 13));
     } catch {
       entry.forget();
       return;
@@ -690,20 +709,8 @@
   }
   function batchText(url, resourceType, text) {
     const source = `${resourceType} ${url}`;
-    const seen = seenTexts[source];
-    if (seen && apply(setHas, seen, [text])) return;
     textBatches[source] ??= new TextBatch(source, url, resourceType);
     textBatches[source].add(text);
-  }
-  function markSeen(source, text) {
-    if (text.length > MAX_CAPTURE_CHARS) return;
-    if (seenTextChars + text.length > MAX_CAPTURE_CHARS) {
-      seenTexts = { __proto__: null };
-      seenTextChars = 0;
-    }
-    seenTexts[source] ??= new NativeSet();
-    apply(setAdd, seenTexts[source], [text]);
-    seenTextChars += text.length;
   }
   var TextBatch = class {
     static {
@@ -733,13 +740,10 @@
         let text = texts[0];
         for (let index = 1; index < texts.length; index += 1) text = `${text}
 ${texts[index]}`;
-        const scanned = await own(captureText(text, (part) => sendResponseWindow(this.url, this.resourceType, part)));
-        for (let index = 0; index < texts.length; index += 1) {
-          apply(setDelete, this.queued, [texts[index]]);
-          if (scanned) markSeen(this.source, texts[index]);
-        }
+        await own(captureText(text, (part) => sendResponseWindow(this.url, this.resourceType, part)));
+        for (let index = 0; index < texts.length; index += 1) apply(setDelete, this.queued, [texts[index]]);
       }
-      this.capturing = false;
+      delete textBatches[this.source];
     }
   };
   function hookShadowRoots(realm, facadeOf) {
@@ -1091,9 +1095,10 @@ ${texts[index]}`;
     }.clone;
     const parseJSON = realm.JSON.parse;
     const parse = (text) => apply(parseJSON, void 0, [text]);
+    const nativeResponseText = response.text;
     const read = (prototype, name, source, json) => {
       const native = prototype[name];
-      const nativeText = prototype.text;
+      const nativeText = json ? nativeResponseText : native;
       prototype[name] = {
         [name]() {
           const facade = facadeOf();
@@ -1245,11 +1250,9 @@ ${texts[index]}`;
     if (sinksPass(realm)) {
       const state = { __proto__: null, policy: null, page: null };
       const member = (name) => ({
-        // Chrome calls a default policy for a sink with the value, the trusted
-        // type name and the sink; a page calls the policy it created directly.
-        // Where sinks pass, a page's own default policy still applies, as under
-        // its own report-only header (it may sanitize): its result is used, and
-        // a value it returns null or undefined for passes unchanged, unreported.
+        // Chrome calls a default policy with (value, trusted type name, sink); a page calls
+        // it directly. Where sinks pass, the page's own default policy still applies first
+        // (it may sanitize); a null or undefined result passes the value unchanged.
         [name](input, typeName) {
           const sinkCall = typeName === TRUSTED_TYPE_NAMES[name];
           const pageMember = state.page?.[name];
@@ -1431,8 +1434,6 @@ ${texts[index]}`;
   var capturedBodies = new NativeWeakSet();
   var readMessages = new NativeWeakSet();
   var textBatches = { __proto__: null };
-  var seenTexts = { __proto__: null };
-  var seenTextChars = 0;
   function hookFrameAccess(realm, facadeOf) {
     const adoptFramesAfter = (target) => {
       const view = viewOf(target);
@@ -1631,18 +1632,13 @@ ${texts[index]}`;
   function watchPopup(popupDocument, url) {
     let due = false;
     let capturing = false;
-    let captured = "";
     const roots = [];
     const capture = async () => {
       due = false;
       capturing = true;
       try {
         const root = apply(documentElementOf, popupDocument, []);
-        const text = root ? popupMarkup(root, roots) : "";
-        if (text !== captured) {
-          captured = text;
-          await own(captureText(text, (part) => sendResponseWindow(url, "Popup", part)));
-        }
+        if (root) await own(captureText(popupMarkup(root, roots), (part) => sendResponseWindow(url, "Popup", part)));
       } finally {
         capturing = false;
         if (due) scheduleTimeout(capture, CAPTURE_FLUSH_MS);
@@ -1732,18 +1728,12 @@ ${texts[index]}`;
     }
   }
   async function captureText(text, send) {
-    if (captureStopped || typeof text !== "string" || text.length === 0) return false;
-    let lease;
+    if (captureStopped || typeof text !== "string" || text.length === 0) return;
     try {
-      lease = await own(captureMemory.lease(CAPTURE_MEMORY_MINIMUM));
-      const capture = new TextCapture(lease, send);
+      const capture = new TextCapture(send);
       await own(capture.write(text));
-      await own(capture.finish());
-      return capture.scanned;
+      await own(capture.flush());
     } catch {
-      return false;
-    } finally {
-      lease?.release();
     }
   }
   function startResponseCapture(response, url) {
@@ -1751,21 +1741,14 @@ ${texts[index]}`;
     try {
       clone = apply(responseClone, response, []);
     } catch {
-      return void 0;
+      return;
     }
     apply(weakSetAdd, capturedBodies, [response]);
     const branches = new PageBranches(apply(responseBody, response, []));
-    let resolveAdmission;
-    const admitted = own(new NativePromise((resolve) => {
-      resolveAdmission = resolve;
-    }));
     void captureStream(
       () => branches.opened(new StreamTextReader(apply(responseBody, clone, []))),
-      CAPTURE_MEMORY_RESERVATION,
-      (part) => sendResponseWindow(url, "Fetch", part),
-      resolveAdmission
+      (part) => sendResponseWindow(url, "Fetch", part)
     );
-    return admitted;
   }
   var PageBranches = class {
     static {
@@ -1781,7 +1764,6 @@ ${texts[index]}`;
       apply(weakMapSet, pageBranches, [stream, this]);
       this.count += 1;
     }
-    // The stream was canceled, or split into the given streams.
     replace(stream, streams) {
       if (!apply(weakMapDelete, pageBranches, [stream])) return;
       this.count -= 1;
@@ -1801,23 +1783,14 @@ ${texts[index]}`;
   var READER_INTERFACES = ["ReadableStreamDefaultReader", "ReadableStreamBYOBReader"];
   function captureBlob(blob, send, encoding = "utf-8") {
     if (encoding === "utf-8") apply(weakSetAdd, capturedBodies, [blob]);
-    void captureStream(
-      () => new StreamTextReader(apply(blobStream, blob, []), encoding),
-      CAPTURE_MEMORY_MINIMUM,
-      send
-    );
+    void captureStream(() => new StreamTextReader(apply(blobStream, blob, []), encoding, true), send);
   }
-  async function captureStream(openReader, leaseSize, send, resolveAdmission = () => {
-  }) {
-    let lease;
+  async function captureStream(openReader, send) {
     let reader;
     let finished = false;
     try {
-      lease = await own(captureMemory.lease(leaseSize));
-      resolveAdmission();
       reader = openReader();
-      const capture = new TextCapture(lease, send);
-      lease.shrink(capture.retainedBytes());
+      const capture = new TextCapture(send);
       try {
         let read = own(reader.read());
         while (!captureStopped) {
@@ -1835,12 +1808,10 @@ ${texts[index]}`;
         }
       } catch {
       }
-      await own(capture.finish());
+      await own(capture.flush());
     } catch {
     } finally {
-      resolveAdmission();
       if (!finished) reader?.cancel();
-      lease?.release();
     }
   }
   function settleOrFlushDue(read, delay) {
@@ -1860,9 +1831,10 @@ ${texts[index]}`;
     static {
       setPrototypeOf(this.prototype, null);
     }
-    constructor(stream) {
+    constructor(stream, paced = false) {
       this.chunks = [];
       this.offset = 0;
+      this.paced = paced;
       this.taken = null;
       this.wake = null;
       this.draining = false;
@@ -1879,7 +1851,7 @@ ${texts[index]}`;
         write: (chunk) => {
           append(this.chunks, chunk);
           this.notify();
-          if (this.draining) return void 0;
+          if (!this.paced || this.draining) return void 0;
           return own(new NativePromise((resolve) => {
             this.taken = resolve;
           }));
@@ -1897,8 +1869,7 @@ ${texts[index]}`;
       this.wake = null;
       wake?.();
     }
-    // Resolves once bytes can be taken or the stream has ended; rejects if it
-    // failed. A drained stream ends as a closed one.
+    // A drained stream ends as a closed one.
     async ready() {
       while (this.chunks.length === 0 && !this.ended) {
         await own(new NativePromise((resolve) => {
@@ -1909,7 +1880,6 @@ ${texts[index]}`;
         throw new NativeTypeError("The stream failed");
       }
     }
-    // Takes up to maxBytes of the oldest chunk, or null at the end.
     take(maxBytes) {
       if (this.chunks.length === 0) return null;
       const chunk = this.chunks[0];
@@ -1932,19 +1902,16 @@ ${texts[index]}`;
       this.taken = null;
       taken?.();
     }
-    // Takes every chunk the stream holds now, then ends it. A tee branch holds
-    // every chunk its sibling received, and the pipe hands over held chunks
-    // without a task boundary, so the pipe is aborted after one task: chunks
-    // that need the network by then are not waited for.
+    // A tee branch holds every chunk its sibling received and the pipe hands them over
+    // without a task boundary, so abort after one task; network chunks are not waited for.
     drain() {
       if (this.draining || this.ended) return;
       this.draining = true;
       this.release();
       scheduleTimeout(() => apply(abortController, this.controller, []), 0);
     }
-    // Ends the pipe, canceling the stream. A tee's cancellation can wait for
-    // the other consumer, and is not awaited: cleanup must not hold the capture
-    // hostage to the page reading its branch.
+    // A tee's cancellation can wait for the other consumer, so it is not awaited: cleanup
+    // must not depend on the page reading its branch.
     cancel() {
       this.chunks.length = 0;
       this.release();
@@ -1955,12 +1922,11 @@ ${texts[index]}`;
     static {
       setPrototypeOf(this.prototype, null);
     }
-    constructor(body, encoding = "utf-8") {
-      this.bytes = new StreamBytes(body);
+    constructor(body, encoding = "utf-8", paced = false) {
+      this.bytes = new StreamBytes(body, paced);
       this.decoder = new NativeTextDecoder(encoding);
       this.ended = false;
     }
-    // Resolves with the next decoded text, or null at the end of the body.
     async read() {
       if (this.ended) return null;
       await own(this.bytes.ready());
@@ -1982,24 +1948,17 @@ ${texts[index]}`;
     static {
       setPrototypeOf(this.prototype, null);
     }
-    constructor(lease, send) {
-      this.lease = lease;
+    constructor(send) {
       this.send = send;
       this.text = "";
       this.bytes = 0;
       this.sentChars = 0;
       this.pendingSince = null;
-      this.scanned = true;
     }
     async write(chunk) {
       if (chunk.length === 0) return;
       while (chunk.length > 0) {
-        this.lease.fit(this.retainedBytes());
-        const maxChars = min(
-          MAX_CAPTURE_CHARS,
-          this.lease.capacity - READ_CHUNK_BYTES >> 1
-        );
-        const taken = fitWindow(chunk, maxChars - this.text.length, MAX_SCAN_BYTES - this.bytes);
+        const taken = fitWindow(chunk, MAX_CAPTURE_CHARS - this.text.length, MAX_SCAN_BYTES - this.bytes);
         this.text += apply(stringSlice, chunk, [0, taken.chars]);
         this.bytes += taken.bytes;
         chunk = apply(stringSlice, chunk, [taken.chars]);
@@ -2007,30 +1966,18 @@ ${texts[index]}`;
       }
       if (this.text.length > this.sentChars) this.pendingSince ??= now();
     }
-    // Sends the text not yet sent and keeps the overlap for the next window.
     async flush() {
       this.pendingSince = null;
       if (this.text.length === this.sentChars) return;
       const text = this.text;
-      this.lease.shrink(this.retainedBytes());
-      if (await own(this.send(text)) !== true) this.scanned = false;
+      await own(this.send(text));
       const overlap = apply(textEncode, utf8Encoder, [apply(stringSlice, text, [-SCAN_WINDOW_OVERLAP_CHARS])]);
       this.text = apply(textDecode, utf8Decoder, [overlap]);
       this.bytes = apply(typedArrayByteLength, overlap, []);
       this.sentChars = this.text.length;
-      this.lease.shrink(this.retainedBytes());
     }
-    // The source is exhausted: sends the rest, retaining only that text.
-    async finish() {
-      this.lease.shrink(this.text.length * 2, 0);
-      await own(this.flush());
-    }
-    // Milliseconds until unsent text is due to be scanned, or Infinity.
     flushDelay() {
       return this.pendingSince === null ? Infinity : this.pendingSince + CAPTURE_FLUSH_MS - now();
-    }
-    retainedBytes() {
-      return this.text.length * 2 + READ_CHUNK_BYTES;
     }
   };
   function stringifyJSON(root) {
@@ -2107,123 +2054,16 @@ ${texts[index]}`;
     return `${text}${apply(stringSlice, value, [runStart])}"`;
   }
   function sendResponseWindow(url, resourceType, text) {
-    return sendToBridge({ type: PAGE_HOOK_RESPONSE, url, resourceType, text });
-  }
-  function sendToBridge(message) {
-    return queueCapture(async () => {
-      if (captureStopped) return;
+    return own(new NativePromise((resolve) => {
+      if (captureStopped) {
+        resolve();
+        return;
+      }
       const messageId = nextMessageId++;
-      const acknowledged = own(new NativePromise((resolve) => {
-        pendingAcks[messageId] = resolve;
-      }));
-      apply(postPortMessage, bridgePort, [{ ...message, messageId }]);
-      return await acknowledged;
-    });
-  }
-  function queueCapture(operation) {
-    return own(new NativePromise((resolve, reject) => {
-      append(captureQueue, { __proto__: null, operation, resolve, reject });
-      drainCaptureQueue();
+      pendingAcks[messageId] = resolve;
+      apply(postPortMessage, bridgePort, [{ type: PAGE_HOOK_RESPONSE, url, resourceType, text, messageId }]);
     }));
   }
-  function drainCaptureQueue() {
-    while (activeCaptures < MAX_ACTIVE_CAPTURES && captureQueue.length > 0) {
-      const index = preferNewestCapture && captureQueue.length > 1 ? captureQueue.length - 1 : 0;
-      preferNewestCapture = !preferNewestCapture;
-      const task = removeAt(captureQueue, index);
-      activeCaptures += 1;
-      void runCapture(task);
-    }
-  }
-  async function runCapture(task) {
-    try {
-      task.resolve(await own(task.operation()));
-    } catch (error) {
-      task.reject(error);
-    } finally {
-      activeCaptures -= 1;
-      drainCaptureQueue();
-    }
-  }
-  var CaptureMemoryBudget = class {
-    static {
-      setPrototypeOf(this.prototype, null);
-    }
-    constructor(limit) {
-      this.limit = limit;
-      this.used = 0;
-      this.waiters = [];
-      this.preferNewest = true;
-    }
-    async lease(size) {
-      const reserved = this.reserve(size);
-      if (reserved) await reserved;
-      return new CaptureMemoryLease(this, size);
-    }
-    reserve(size) {
-      if (this.used + size <= this.limit) {
-        this.used += size;
-        return void 0;
-      }
-      return own(new NativePromise((resolve) => {
-        append(this.waiters, { __proto__: null, size, resolve });
-      }));
-    }
-    // Takes up to `size` without waiting, only while no admission waits.
-    take(size) {
-      if (this.waiters.length > 0) return 0;
-      const taken = max(0, min(size, this.limit - this.used));
-      this.used += taken;
-      return taken;
-    }
-    release(size) {
-      this.used -= size;
-      while (this.waiters.length > 0) {
-        const available = this.limit - this.used;
-        let index = -1;
-        const count = this.waiters.length;
-        for (let step = 0; step < count && index < 0; step += 1) {
-          const candidate = this.preferNewest ? count - 1 - step : step;
-          if (this.waiters[candidate].size <= available) index = candidate;
-        }
-        if (index < 0) return;
-        this.preferNewest = !this.preferNewest;
-        const waiter = removeAt(this.waiters, index);
-        this.used += waiter.size;
-        waiter.resolve();
-      }
-    }
-  };
-  var CaptureMemoryLease = class {
-    static {
-      setPrototypeOf(this.prototype, null);
-    }
-    constructor(budget, capacity) {
-      this.budget = budget;
-      this.capacity = capacity;
-    }
-    // Returns what the capture does not retain while an admission waits, and
-    // otherwise grows toward a full window.
-    fit(retained) {
-      if (this.budget.waiters.length > 0) {
-        this.shrink(retained);
-      } else {
-        this.capacity += this.budget.take(CAPTURE_MEMORY_RESERVATION - this.capacity);
-      }
-    }
-    // Keeps at least `minimum`, so a capture that still reads can progress.
-    shrink(retained, minimum = CAPTURE_MEMORY_MINIMUM) {
-      const capacity = max(minimum, retained);
-      if (capacity >= this.capacity) return;
-      this.budget.release(this.capacity - capacity);
-      this.capacity = capacity;
-    }
-    release() {
-      this.budget.release(this.capacity);
-      this.capacity = 0;
-    }
-  };
-  var captureMemory = new CaptureMemoryBudget(CAPTURE_MEMORY_LIMIT);
   {
     const channel = new MessageChannel();
     bridgePort = channel.port1;
@@ -2294,7 +2134,7 @@ ${texts[index]}`;
     const resolve = data?.type === PAGE_HOOK_ACK ? pendingAcks[data.messageId] : void 0;
     if (typeof resolve !== "function") return;
     delete pendingAcks[data.messageId];
-    resolve(data.scanned === true);
+    resolve();
   }
   function stopCapturing() {
     if (captureStopped) return;

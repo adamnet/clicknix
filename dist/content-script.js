@@ -1,4 +1,28 @@
 (() => {
+  // src/activation.js
+  function whenActivated(start) {
+    if (!document.prerendering) {
+      start();
+      return;
+    }
+    const activated = () => {
+      if (document.prerendering) return;
+      observer.disconnect();
+      document.removeEventListener("prerenderingchange", activated);
+      chrome.runtime.onMessage.removeListener(handleMessage);
+      start();
+    };
+    const handleMessage = (message) => {
+      if (message?.type === "start-document") activated();
+      return false;
+    };
+    const listen = () => document.addEventListener("prerenderingchange", activated);
+    const observer = new MutationObserver(listen);
+    observer.observe(document, { childList: true });
+    listen();
+    chrome.runtime.onMessage.addListener(handleMessage);
+  }
+
   // src/config.js
   var MAX_RULE_SOURCE_BYTES = 4 * 1024 * 1024;
   var MAX_RULE_BUNDLE_BYTES = 8 * MAX_RULE_SOURCE_BYTES;
@@ -7,10 +31,10 @@
   var SCAN_WINDOW_OVERLAP_CHARS = 64 * 1024;
   var SHADOW_ROOT_EVENT_GLOBAL = "clickNixShadowRootEvent";
   var BLOB_SCRIPT_GLOBAL = "clickNixBlobScript";
-  var PICTURE_IN_PICTURE_QUERY = "(display-mode: picture-in-picture)";
 
   // src/runtime-message.js
   var pending = /* @__PURE__ */ new Set();
+  var pictureInPicture = matchMedia("(display-mode: picture-in-picture)");
   chrome.runtime.onMessage.addListener((message) => {
     if (message?.type === "rescan-document") {
       for (const resolve of pending) resolve(null);
@@ -18,15 +42,21 @@
     }
     return false;
   });
-  function sendRuntimeMessage(message) {
-    return new Promise((resolve, reject) => {
-      const sent = chrome.runtime.sendMessage(message);
-      pending.add(resolve);
-      sent.then(resolve, reject).finally(() => pending.delete(resolve));
-    });
-  }
-  function isExtensionContextInvalidated(error) {
-    return error instanceof Error && error.message.includes("Extension context invalidated");
+  function createMessageSender(onInvalidated) {
+    return async (message) => {
+      try {
+        return await new Promise((resolve, reject) => {
+          const sent = chrome.runtime.sendMessage({ ...message, pictureInPicture: pictureInPicture.matches });
+          pending.add(resolve);
+          sent.then(resolve, reject).finally(() => pending.delete(resolve));
+        });
+      } catch (error) {
+        if (error instanceof Error && error.message.includes("Extension context invalidated")) {
+          onInvalidated();
+        }
+        return null;
+      }
+    };
   }
 
   // src/scan-response.js
@@ -35,35 +65,82 @@
   }
 
   // src/scan-window.js
-  var charCodeAt = Function.prototype.call.bind(String.prototype.charCodeAt);
+  var call = Function.prototype.call;
+  var charCodeAt = call.bind(String.prototype.charCodeAt);
+  var slice = call.bind(String.prototype.slice);
+  var exec = call.bind(RegExp.prototype.exec);
+  var NON_ASCII = /[^\0-\x7f]/g;
+  var ASCII_RUN_SEARCH = 16;
   function fitWindow(text, maxChars, maxBytes, start = 0) {
-    const end = text.length - start < maxChars ? text.length : start + maxChars;
-    let index = start;
+    const segment = slice(text, start, text.length - start < maxChars ? text.length : start + maxChars);
+    let index = 0;
     let bytes = 0;
-    while (index < end) {
-      const code = charCodeAt(text, index);
+    let ascii = 0;
+    while (index < segment.length) {
+      const code = charCodeAt(segment, index);
       let units = 1;
       let size = 3;
       if (code < 128) {
+        if (++ascii === ASCII_RUN_SEARCH) {
+          NON_ASCII.lastIndex = index;
+          const run = (exec(NON_ASCII, segment)?.index ?? segment.length) - index;
+          if (bytes + run > maxBytes) {
+            index += maxBytes - bytes;
+            bytes = maxBytes;
+            break;
+          }
+          index += run;
+          bytes += run;
+          continue;
+        }
         size = 1;
-      } else if (code < 2048) {
-        size = 2;
-      } else if (code >= 55296 && code <= 56319) {
-        const next = charCodeAt(text, index + 1);
-        if (next >= 56320 && next <= 57343) {
-          units = 2;
-          size = 4;
+      } else {
+        ascii = 0;
+        if (code < 2048) {
+          size = 2;
+        } else if (code >= 55296 && code <= 56319) {
+          const next = charCodeAt(text, start + index + 1);
+          if (next >= 56320 && next <= 57343) {
+            units = 2;
+            size = 4;
+          }
         }
       }
-      if (index + units > end || bytes + size > maxBytes) break;
+      if (index + units > segment.length || bytes + size > maxBytes) break;
       index += units;
       bytes += size;
     }
-    return { chars: index - start, bytes };
+    return { chars: index, bytes };
   }
   function utf8Length(text) {
     return fitWindow(text, text.length, Infinity).bytes;
   }
+  var TextWindows = class {
+    #text = "";
+    #start = 0;
+    #bytes = 0;
+    push(text) {
+      this.#text = this.#text.slice(this.#start) + text;
+      this.#start = 0;
+      this.#bytes += utf8Length(text);
+      const windows = [];
+      while (this.#text.length - this.#start > MAX_CAPTURE_CHARS || this.#bytes > MAX_SCAN_BYTES) {
+        const { chars, bytes } = fitWindow(this.#text, MAX_CAPTURE_CHARS, MAX_SCAN_BYTES, this.#start);
+        const end = this.#start + chars;
+        windows.push(this.#text.slice(this.#start, end));
+        this.#start = end - SCAN_WINDOW_OVERLAP_CHARS;
+        this.#bytes -= bytes - fitWindow(this.#text, SCAN_WINDOW_OVERLAP_CHARS, Infinity, this.#start).bytes;
+      }
+      return windows;
+    }
+    end() {
+      const text = this.#text.slice(this.#start);
+      this.#text = "";
+      this.#start = 0;
+      this.#bytes = 0;
+      return text ? [text] : [];
+    }
+  };
 
   // src/script-source.js
   var DATA_CHUNK_BYTES = 64 * 1024;
@@ -155,8 +232,7 @@
   var pendingExternalScripts = /* @__PURE__ */ new Set();
   var seenInlineScripts = /* @__PURE__ */ new WeakSet();
   var pendingInlineScripts = /* @__PURE__ */ new WeakSet();
-  var externalScriptQueue = [];
-  var externalScriptIdleWaiters = [];
+  var dataScriptQueue = [];
   var pendingInlineMessages = /* @__PURE__ */ new Set();
   var pendingChanges = /* @__PURE__ */ new Map();
   var changeQueue = [];
@@ -164,8 +240,7 @@
   var templateOwners = /* @__PURE__ */ new WeakMap();
   var queuedLightHosts = /* @__PURE__ */ new WeakSet();
   var PARSER_PROBE_INTERVAL_MS = 16;
-  var MAX_OUTSTANDING_EXTERNAL_SCRIPTS = 4;
-  var MAX_OUTSTANDING_URGENT_EXTERNAL_SCRIPTS = 2;
+  var MAX_OUTSTANDING_DATA_SCRIPTS = 4;
   var SEPARATOR_MAX_CHARS = 1 + SCAN_WINDOW_OVERLAP_CHARS;
   var HTML_NAMESPACE = "http://www.w3.org/1999/xhtml";
   var HTML_VOID_ELEMENTS = /* @__PURE__ */ new Set([
@@ -234,11 +309,11 @@
     subtree: true
   };
   var documentObserver = new MutationObserver(handleDocumentMutations);
-  var pictureInPicture = matchMedia(PICTURE_IN_PICTURE_QUERY);
+  var sendRuntimeMessage = createMessageSender(stopDocumentScanning);
   var shadowRootEvent = globalThis[SHADOW_ROOT_EVENT_GLOBAL];
   var inlineMessageQueue = Promise.resolve();
-  var activeExternalScriptMessages = 0;
-  var activeUrgentExternalScriptMessages = 0;
+  var activeDataScriptMessages = 0;
+  var rescanGeneration = 0;
   var changeQueueHead = 0;
   var documentScanRequested = false;
   var changedDocumentDrainRunning = false;
@@ -247,22 +322,9 @@
   var drainCursor = null;
   var frontierTail = "";
   var preferChanges = false;
+  var documentWindowUnscanned = false;
   var parsingWatched = false;
   var documentScanningStarted = false;
-  var stopWaitingForActivation;
-  async function sendRuntimeMessage2(message) {
-    try {
-      return await sendRuntimeMessage({
-        ...message,
-        pictureInPicture: pictureInPicture.matches
-      });
-    } catch (error) {
-      if (isExtensionContextInvalidated(error)) {
-        stopDocumentScanning();
-      }
-      return null;
-    }
-  }
   function stopDocumentScanning() {
     documentObserver.disconnect();
     pendingChanges.clear();
@@ -271,22 +333,14 @@
     changeQueueHead = 0;
     documentScanRequested = false;
     finishFrontier();
-    externalScriptQueue.length = 0;
+    dataScriptQueue.length = 0;
   }
   function initialize() {
     if (!chrome.runtime?.id) return;
     chrome.runtime.onMessage.addListener(handleRuntimeMessage);
-    if (document.prerendering) {
-      waitForActivation();
-    } else {
-      startDocumentScanning();
-    }
+    whenActivated(startDocumentScanning);
   }
   function handleRuntimeMessage(message, _sender, sendResponse) {
-    if (message?.type === "start-document") {
-      startDocumentScanning();
-      return false;
-    }
     if (message?.type !== "rescan-document" && message?.type !== "resume-document") {
       return false;
     }
@@ -307,7 +361,6 @@
   function startDocumentScanning() {
     if (documentScanningStarted || document.prerendering) return;
     documentScanningStarted = true;
-    stopWaitingForActivation?.();
     listenForShadowRoots();
     documentObserver.observe(document, OBSERVER_OPTIONS);
     frontier = new NodeSerializationCursor(document, true, true);
@@ -318,16 +371,6 @@
     observeLoadedScripts();
     scanRegisteredServiceWorkers();
   }
-  function waitForActivation() {
-    const listen = () => document.addEventListener("prerenderingchange", startDocumentScanning);
-    const observer = new MutationObserver(listen);
-    stopWaitingForActivation = () => {
-      observer.disconnect();
-      document.removeEventListener("prerenderingchange", startDocumentScanning);
-    };
-    observer.observe(document, { childList: true });
-    listen();
-  }
   function listenForShadowRoots() {
     addEventListener(shadowRootEvent, handleShadowRootAttached, true);
   }
@@ -336,9 +379,9 @@
     void drainChangedDocumentNodes();
   }
   async function rescanDocument() {
-    scanDocument();
+    if (changedDocumentDrainRunning || documentWindowUnscanned) scanDocument();
     await Promise.allSettled([...pendingInlineMessages]);
-    await waitForExternalScriptQueueIdle();
+    rescanGeneration += 1;
     scanScriptElements();
     scanLoadedScriptResources();
     scanRegisteredServiceWorkers();
@@ -375,7 +418,7 @@
           registration.installing
         ]) {
           if (worker?.scriptURL) {
-            queueExternalScriptURL(worker.scriptURL, false, "utf-8");
+            queueExternalScriptURL(worker.scriptURL, "utf-8");
           }
         }
       }
@@ -496,17 +539,12 @@
     shadowRoot.addEventListener(shadowRootEvent, handleShadowRootAttached, true);
   }
   async function sendTextWindows(type, text) {
-    for (let start = 0; ; ) {
-      const { chars } = fitWindow(text.slice(start), MAX_CAPTURE_CHARS, MAX_SCAN_BYTES);
-      const response = await sendRuntimeMessage2({
-        type,
-        url: location.href,
-        payload: text.slice(start, start + chars)
-      });
+    const windows = new TextWindows();
+    for (const payload of [...windows.push(text), ...windows.end()]) {
+      const response = await sendRuntimeMessage({ type, url: location.href, payload });
       if (!wasScanAttempted(response)) return false;
-      if (start + chars >= text.length) return true;
-      start += chars - SCAN_WINDOW_OVERLAP_CHARS;
     }
+    return true;
   }
   async function drainChangedDocumentNodes() {
     if (changedDocumentDrainRunning) return;
@@ -542,11 +580,12 @@
         }
         if (payload.length === overlap.length) break;
         overlap = drainCursor ? payload.slice(-SCAN_WINDOW_OVERLAP_CHARS) : "";
-        await sendRuntimeMessage2({
+        const response = await sendRuntimeMessage({
           type: documentPayload ? "scan-document" : "scan-document-change",
           url: location.href,
           payload
         });
+        if (!wasScanAttempted(response)) documentWindowUnscanned = true;
       }
     } finally {
       drainCursor = null;
@@ -563,6 +602,7 @@
   function nextChangeCursor() {
     if (documentScanRequested) {
       documentScanRequested = false;
+      documentWindowUnscanned = false;
       if (document.documentElement) {
         return new NodeSerializationCursor(document.documentElement, true);
       }
@@ -614,17 +654,12 @@
       this.parked = false;
       this.loading = document.readyState === "loading";
     }
-    // Reads at most `maxChars` characters and `maxBytes` of UTF-8.
     read(maxChars, maxBytes) {
       let text = "";
       let bytes = 0;
       this.resume();
       while (text.length < maxChars && this.advance()) {
-        const taken = fitWindow(
-          this.offset > 0 ? this.pending.slice(this.offset) : this.pending,
-          maxChars - text.length,
-          maxBytes - bytes
-        );
+        const taken = fitWindow(this.pending, maxChars - text.length, maxBytes - bytes, this.offset);
         if (taken.chars === 0) break;
         text += this.pending.slice(this.offset, this.offset + taken.chars);
         this.offset += taken.chars;
@@ -633,12 +668,9 @@
       this.snapshot();
       return { text, bytes };
     }
-    // A shadow root is serialized before its host's light children, and the
-    // frontier waits at a root's end while the parser may append to it, which
-    // for a root script attached to a host the parser is filling lasts until
-    // parsing ends. So while the frontier is inside a root, the host's light
-    // DOM changes, and once it waits there the host's light children, are
-    // scanned as changes, and serialized again when the frontier gets there.
+    // A root is serialized before its host's light children, and the frontier may wait at
+    // its end until parsing ends. Meanwhile the host's light DOM is scanned as changes, and
+    // serialized again when the frontier gets there.
     snapshot() {
       this.openWalks.clear();
       this.shadowHosts.length = 0;
@@ -678,11 +710,9 @@
         }
       }
     }
-    // The parser attaches a declarative shadow root (<template shadowrootmode>)
-    // to an element it is inside, possibly after the frontier visited it. While
-    // the frontier waits in that element's walk, the root is serialized in
-    // place, so the parser's further insertions into it continue the frontier's
-    // output, which overlaps across windows, instead of each becoming a change.
+    // The parser may attach a declarative shadow root after the frontier visited its host.
+    // While the frontier waits in the host's walk, the root is serialized in place, so later
+    // insertions continue the frontier's output instead of each becoming a change.
     adoptShadowRoot(host, shadowRoot) {
       const top = this.stack[this.stack.length - 1];
       if (this.offset < this.pending.length || typeof top !== "object" || top.parent !== host) {
@@ -699,11 +729,9 @@
     coversChildren(target, nextSibling) {
       return nextSibling === null && this.openWalks.has(target) && !this.inShadowHost(target) || this.isAhead(target);
     }
-    // Whether the frontier has yet to reach `node`, so it will serialize the
-    // node's current state: below the nearest parent whose walk is open, `node`
-    // is in a child after the last one the walk visited. A node inserted
-    // elsewhere than at the end of that parent counts as passed, which at worst
-    // serializes it twice.
+    // Whether the frontier has yet to reach `node`: below the nearest parent with an open
+    // walk, it follows the last visited child. A node inserted elsewhere than at that
+    // parent's end counts as passed, which at worst serializes it twice.
     isAhead(node) {
       if (this.inShadowHost(node)) return false;
       for (let child = node, parent = node?.parentNode; parent; child = parent, parent = parent.parentNode) {
@@ -892,7 +920,7 @@
     if (url) {
       const encoding = scriptFallbackEncoding(script);
       if (url.startsWith("blob:") && encoding !== "utf-8") globalThis[BLOB_SCRIPT_GLOBAL]?.(url, encoding);
-      queueExternalScriptURL(url, live, encoding);
+      queueExternalScriptURL(url, encoding);
       return;
     }
     if (pendingInlineScripts.has(script) || !live && seenInlineScripts.has(script)) {
@@ -920,49 +948,51 @@
     const label = script instanceof HTMLScriptElement ? script.getAttribute("charset") : null;
     return encodingName(label) ?? encodingName(document.characterSet) ?? "utf-8";
   }
-  function queueExternalScriptURL(url, urgent = false, encoding = scriptFallbackEncoding()) {
+  function queueExternalScriptURL(url, encoding = scriptFallbackEncoding()) {
     const normalizedURL = normalizeExternalScriptURL(url);
     const key = `${encoding} ${normalizedURL}`;
     if (!normalizedURL || seenExternalScripts.has(key) || pendingExternalScripts.has(key)) return;
     pendingExternalScripts.add(key);
-    externalScriptQueue.push({ url: normalizedURL, urgent, encoding, key });
-    pumpExternalScriptQueue();
-  }
-  function pumpExternalScriptQueue() {
-    while (externalScriptQueue.length > 0) {
-      const urgentIndex = activeUrgentExternalScriptMessages < MAX_OUTSTANDING_URGENT_EXTERNAL_SCRIPTS ? externalScriptQueue.findIndex((entry2) => entry2.urgent) : -1;
-      const normalIndex = activeExternalScriptMessages < MAX_OUTSTANDING_EXTERNAL_SCRIPTS ? externalScriptQueue.findIndex((entry2) => !entry2.urgent) : -1;
-      const entryIndex = urgentIndex >= 0 ? urgentIndex : normalIndex;
-      if (entryIndex < 0) return;
-      const [entry] = externalScriptQueue.splice(entryIndex, 1);
-      if (entry.urgent) {
-        activeUrgentExternalScriptMessages += 1;
-      } else {
-        activeExternalScriptMessages += 1;
-      }
-      let retryAsNormal = false;
-      void sendRuntimeMessage2({
-        type: "scan-script-url",
-        url: entry.url,
-        urgent: entry.urgent,
-        encoding: entry.encoding
-      }).then((response) => {
-        retryAsNormal = response?.result?.preempted === true;
-        if (!retryAsNormal && wasScanAttempted(response)) {
-          seenExternalScripts.add(entry.key);
-        }
-      }).finally(() => {
-        pendingExternalScripts.delete(entry.key);
-        if (entry.urgent) {
-          activeUrgentExternalScriptMessages -= 1;
-        } else {
-          activeExternalScriptMessages -= 1;
-        }
-        pumpExternalScriptQueue();
-        notifyExternalScriptQueueIdle();
-        if (retryAsNormal) queueExternalScriptURL(entry.url, false, entry.encoding);
+    const entry = { url: normalizedURL, encoding, key };
+    if (isDataURL(normalizedURL)) {
+      dataScriptQueue.push(entry);
+      pumpDataScriptQueue();
+    } else {
+      void sendExternalScriptURL(entry).catch(() => {
       });
     }
+  }
+  function pumpDataScriptQueue() {
+    while (activeDataScriptMessages < MAX_OUTSTANDING_DATA_SCRIPTS && dataScriptQueue.length > 0) {
+      const entry = dataScriptQueue.shift();
+      activeDataScriptMessages += 1;
+      void sendExternalScriptURL(entry).catch(() => {
+      }).finally(() => {
+        activeDataScriptMessages -= 1;
+        pumpDataScriptQueue();
+      });
+    }
+  }
+  async function sendExternalScriptURL(entry) {
+    const generation = rescanGeneration;
+    let response = null;
+    try {
+      response = await sendRuntimeMessage({
+        type: "scan-script-url",
+        url: entry.url,
+        encoding: entry.encoding
+      });
+    } finally {
+      pendingExternalScripts.delete(entry.key);
+    }
+    if (wasScanAttempted(response)) {
+      if (!isDataURL(entry.url)) seenExternalScripts.add(entry.key);
+    } else if (generation !== rescanGeneration) {
+      queueExternalScriptURL(entry.url, entry.encoding);
+    }
+  }
+  function isDataURL(url) {
+    return url.slice(0, 5).toLowerCase() === "data:";
   }
   function normalizeExternalScriptURL(value) {
     if (typeof value !== "string" || value.length === 0) return null;
@@ -972,19 +1002,6 @@
       return url.href;
     } catch {
       return value;
-    }
-  }
-  function isExternalScriptQueueIdle() {
-    return activeExternalScriptMessages === 0 && activeUrgentExternalScriptMessages === 0 && externalScriptQueue.length === 0;
-  }
-  function waitForExternalScriptQueueIdle() {
-    if (isExternalScriptQueueIdle()) return Promise.resolve();
-    return new Promise((resolve) => externalScriptIdleWaiters.push(resolve));
-  }
-  function notifyExternalScriptQueueIdle() {
-    if (!isExternalScriptQueueIdle()) return;
-    for (const resolve of externalScriptIdleWaiters.splice(0)) {
-      resolve();
     }
   }
   initialize();

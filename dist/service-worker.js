@@ -2,6 +2,7 @@
 var MAX_RULE_SOURCE_BYTES = 4 * 1024 * 1024;
 var MAX_RULE_BUNDLE_BYTES = 8 * MAX_RULE_SOURCE_BYTES;
 var MAX_SCAN_BYTES = 2 * 1024 * 1024;
+var MAX_SCAN_BUFFERS = 800;
 var MAX_CAPTURE_CHARS = 15e5;
 var SCAN_WINDOW_OVERLAP_CHARS = 64 * 1024;
 
@@ -19,6 +20,7 @@ var SCANNER_WORKER_MESSAGES = Object.freeze({
   INITIALIZATION_FAILED: "initialization-failed",
   SCAN: "scan",
   SCAN_FAILED: "scan-failed",
+  SCAN_PROGRESS: "scan-progress",
   SCAN_RESULT: "scan-result"
 });
 var SCANNER_FAILURE_CODES = Object.freeze({
@@ -66,7 +68,7 @@ var runtime;
 var runtimePromise;
 var runtimeStatus = { state: "initializing" };
 var hostNeedsReset = false;
-var scanQueue = Promise.resolve();
+var hostClient;
 async function initializeScannerRuntime() {
   if (runtime) {
     return runtime;
@@ -92,38 +94,29 @@ async function getScannerStatus() {
     return failedStatus(isScannerFailure(hostStatus.failure) ? hostStatus.failure : invalidHostResponse("ClickNix scanner host returned an invalid failed status"));
   }
   if (["initializing", "ready"].includes(hostStatus?.state)) {
-    return {
-      state: hostStatus.state,
-      ...hostStatus.runtime?.rulesVersion ? { rulesVersion: hostStatus.runtime.rulesVersion } : {}
-    };
+    return { state: hostStatus.state };
   }
   return failedStatus(invalidHostResponse("ClickNix scanner host returned an invalid status"));
 }
-function scanText(text) {
-  return scanBytes(new TextEncoder().encode(text));
-}
-async function scanBytes(source) {
-  const [result] = await scanBatch([source]);
-  if (result.error) throw result.error;
-  return result;
-}
 async function scanBatch(buffers) {
-  const previousScan = scanQueue;
-  let releaseScan;
-  scanQueue = new Promise((resolve) => {
-    releaseScan = resolve;
-  });
-  await previousScan;
   try {
     return await scanBatchNow(buffers);
-  } finally {
-    releaseScan();
+  } catch (error) {
+    if (buffers.length === 1) throw error;
+    const failed = error?.scannerFailure?.bufferIndex;
+    if (!Number.isInteger(failed) || failed < 0 || failed >= buffers.length) {
+      return buffers.map(() => ({ error }));
+    }
+    const others = buffers.filter((_buffer, index) => index !== failed);
+    const results = await scanBatch(others).catch((othersError) => others.map(() => ({ error: othersError })));
+    results.splice(failed, 0, { error });
+    return results;
   }
 }
 async function scanBatchNow(buffers) {
   const byteLength = buffers.reduce((total, buffer) => total + buffer.byteLength, 0);
-  if (byteLength > MAX_SCAN_BYTES) {
-    throw new Error(`Scan buffers of ${byteLength} bytes exceed the scan byte limit`);
+  if (byteLength > MAX_SCAN_BYTES || buffers.length > MAX_SCAN_BUFFERS) {
+    throw new Error(`${buffers.length} scan buffers of ${byteLength} bytes exceed one scanner request`);
   }
   let result;
   try {
@@ -137,7 +130,7 @@ async function scanBatchNow(buffers) {
   if (result?.results?.length !== buffers.length) {
     throw scannerError(invalidHostResponse("ClickNix scanner host returned an invalid scan result"));
   }
-  return result.results.map(({ matches, warnings, failure }) => failure ? { error: scannerError(isScannerFailure(failure) ? failure : invalidHostResponse("ClickNix scanner host returned an invalid buffer failure")) } : { rulesVersion: result.rulesVersion, matches, warnings });
+  return result.results.map(({ matches, failure }) => failure ? { error: scannerError(isScannerFailure(failure) ? failure : invalidHostResponse("ClickNix scanner host returned an invalid buffer failure")) } : { rulesVersion: result.rulesVersion, matches });
 }
 async function scanOnce(buffers, byteLength) {
   await initializeScannerRuntime();
@@ -156,19 +149,23 @@ async function scanOnce(buffers, byteLength) {
   return response.result;
 }
 async function deliverPayload(requestId, buffers, byteLength) {
-  const hostURL = chrome.runtime.getURL(SCANNER_HOST_PATH);
-  const windows = await self.clients.matchAll({ includeUncontrolled: true, type: "window" });
-  const host = windows.find((client) => client.url === hostURL);
-  if (!host) {
-    throw new Error("scanner host document is not open");
-  }
+  hostClient ??= await findHostClient();
   const payload = new Uint8Array(byteLength);
   let offset = 0;
   for (const buffer of buffers) {
     payload.set(buffer, offset);
     offset += buffer.byteLength;
   }
-  host.postMessage({ requestId, payload: payload.buffer }, [payload.buffer]);
+  hostClient.postMessage({ requestId, payload: payload.buffer }, [payload.buffer]);
+}
+async function findHostClient() {
+  const hostURL = chrome.runtime.getURL(SCANNER_HOST_PATH);
+  const windows = await self.clients.matchAll({ includeUncontrolled: true, type: "window" });
+  const host = windows.find((client) => client.url === hostURL);
+  if (!host) {
+    throw new Error("scanner host document is not open");
+  }
+  return host;
 }
 async function createRuntime() {
   try {
@@ -183,10 +180,7 @@ async function createRuntime() {
     SCANNER_TIMEOUTS.INITIALIZE_MS
   );
   runtime = response.runtime;
-  runtimeStatus = {
-    state: "ready",
-    rulesVersion: runtime.rulesVersion
-  };
+  runtimeStatus = { state: "ready" };
   return runtime;
 }
 async function ensureScannerHost() {
@@ -220,6 +214,7 @@ async function requestRuntime(request, hostTimeoutMs) {
 }
 function forgetRuntime(failure) {
   runtime = void 0;
+  hostClient = void 0;
   runtimeStatus = failedStatus(failure);
   if (failure.code === SCANNER_FAILURE_CODES.HOST_UNAVAILABLE) {
     hostNeedsReset = true;
@@ -274,11 +269,7 @@ function scannerError(failure) {
   return error;
 }
 function failedStatus(failure) {
-  return {
-    state: "failed",
-    error: failure.message,
-    failure
-  };
+  return { state: "failed", failure };
 }
 function errorDetail(error) {
   return error instanceof Error ? error.message : String(error);
@@ -291,50 +282,78 @@ var NAMED_HIDDEN_WINDOW = new RegExp(
   "i"
 );
 var NUMERIC_HIDDEN_WINDOWS = new RegExp(String.raw`${WINDOW_OPTION}[12](?![\w.])`, "gi");
+var PIPED_PATH = String.raw`(?:[a-z]:|%\w+%)?[\\/][\w\\/.%()-]*[\\/]`;
+var PIPED_INTERPRETER = String.raw`(?:(?:ba|z)?sh|powershell|pwsh|cmd|python[\d.]*|perl|ruby|node|osascript)`;
+var PIPED_WRAPPER = new RegExp(String.raw`(?:${PIPED_PATH})?(?:sudo|nohup|env|exec|command)\s+`, "iy");
+var PIPED_PROGRAM = new RegExp(
+  String.raw`${PIPED_INTERPRETER}\b|${PIPED_PATH}${PIPED_INTERPRETER}(?:\.exe)?(?![\w\\/.-])`,
+  "iy"
+);
+var EXECUTE = new RegExp(
+  String.raw`\b(?:iex|invoke-expression|start-process)\b|\[scriptblock\]::create\b|` + String.raw`&\s*\(|(?:^|[|;(])\s*\.\s*\(|[$<]\(\s*(?:curl|wget)\b|\bchmod\s+\+x\b|` + String.raw`(?:&&?|;)\s*(?:(?:start|call)\b|(?:sudo\s+)?(?:(?:ba|z)?sh|source|\.)\s+\S|[.~]?\/\S|["']?[^\s&|;"']*\.(?:exe|bat|cmd|com|ps1|vbs|js|hta|msi|scr)\b)`,
+  "i"
+);
 var CLIPBOARD_NOTICE_MESSAGE = "clipboard-notice";
 var CLIPBOARD_COMMAND = Object.freeze({
-  // Disguised, hidden, encoded or remote-loader command: the ClickFix pattern.
   SCAM: "scam",
-  // A command that downloads and runs code, like many installer one-liners.
   DOWNLOAD_EXECUTE: "download-execute"
 });
 
 // src/scan-window.js
-var charCodeAt = Function.prototype.call.bind(String.prototype.charCodeAt);
+var call = Function.prototype.call;
+var charCodeAt = call.bind(String.prototype.charCodeAt);
+var slice = call.bind(String.prototype.slice);
+var exec = call.bind(RegExp.prototype.exec);
+var NON_ASCII = /[^\0-\x7f]/g;
+var ASCII_RUN_SEARCH = 16;
 function fitWindow(text, maxChars, maxBytes, start = 0) {
-  const end = text.length - start < maxChars ? text.length : start + maxChars;
-  let index = start;
+  const segment = slice(text, start, text.length - start < maxChars ? text.length : start + maxChars);
+  let index = 0;
   let bytes = 0;
-  while (index < end) {
-    const code = charCodeAt(text, index);
+  let ascii = 0;
+  while (index < segment.length) {
+    const code = charCodeAt(segment, index);
     let units = 1;
     let size = 3;
     if (code < 128) {
+      if (++ascii === ASCII_RUN_SEARCH) {
+        NON_ASCII.lastIndex = index;
+        const run = (exec(NON_ASCII, segment)?.index ?? segment.length) - index;
+        if (bytes + run > maxBytes) {
+          index += maxBytes - bytes;
+          bytes = maxBytes;
+          break;
+        }
+        index += run;
+        bytes += run;
+        continue;
+      }
       size = 1;
-    } else if (code < 2048) {
-      size = 2;
-    } else if (code >= 55296 && code <= 56319) {
-      const next = charCodeAt(text, index + 1);
-      if (next >= 56320 && next <= 57343) {
-        units = 2;
-        size = 4;
+    } else {
+      ascii = 0;
+      if (code < 2048) {
+        size = 2;
+      } else if (code >= 55296 && code <= 56319) {
+        const next = charCodeAt(text, start + index + 1);
+        if (next >= 56320 && next <= 57343) {
+          units = 2;
+          size = 4;
+        }
       }
     }
-    if (index + units > end || bytes + size > maxBytes) break;
+    if (index + units > segment.length || bytes + size > maxBytes) break;
     index += units;
     bytes += size;
   }
-  return { chars: index - start, bytes };
+  return { chars: index, bytes };
 }
 function utf8Length(text) {
   return fitWindow(text, text.length, Infinity).bytes;
 }
 var TextWindows = class {
   #text = "";
-  // Where the unfinished window starts in #text, and its UTF-8 size.
   #start = 0;
   #bytes = 0;
-  // Adds text and returns the windows it completed.
   push(text) {
     this.#text = this.#text.slice(this.#start) + text;
     this.#start = 0;
@@ -349,7 +368,6 @@ var TextWindows = class {
     }
     return windows;
   }
-  // Returns the last window, if any text is left.
   end() {
     const text = this.#text.slice(this.#start);
     this.#text = "";
@@ -394,7 +412,7 @@ function* dataScriptWindows(value, fallback) {
         if (seen.has(key) || seen.has(digest)) return;
         seen.add(key);
         queue.push({ depth: leaf ? MAX_DATA_SCRIPT_DEPTH : depth + 1, url: nestedURL });
-      }) : void 0;
+      }, depth + 1 < MAX_DATA_SCRIPT_DEPTH) : void 0;
       let layer;
       const decoding = decodedWindows(body, encoding, nested);
       let step;
@@ -582,12 +600,7 @@ function isPlainASCII(bytes) {
 }
 function parseDataURL(value) {
   if (typeof value !== "string") return null;
-  let start = 0;
-  let end = value.length;
-  while (start < end && value.charCodeAt(start) <= 32) start += 1;
-  while (end > start && value.charCodeAt(end - 1) <= 32) end -= 1;
-  let url = value.slice(start, end);
-  if (URL_TAB_OR_NEWLINE.test(url)) url = url.replace(new RegExp(URL_TAB_OR_NEWLINE, "g"), "");
+  let url = urlText(value);
   if (url.slice(0, DATA_PREFIX.length).toLowerCase() !== DATA_PREFIX) return null;
   const fragment = url.indexOf("#");
   if (fragment >= 0) url = url.slice(0, fragment);
@@ -712,8 +725,11 @@ var NestedDataURLs = class {
   #kept = "";
   #parts = [];
   #partsLength = 0;
-  constructor(found) {
+  #state;
+  // searched: whether the decodings of the URLs found (not leaves) are searched.
+  constructor(found, searched = true) {
     this.#found = found;
+    this.#state = { leafEnd: -1, searched };
   }
   push(text) {
     this.#parts.push(text);
@@ -730,62 +746,175 @@ var NestedDataURLs = class {
     this.#partsLength = 0;
     const undecided = findDataJavaScriptURLs(source, final, (url, leaf) => {
       if (parseDataURL(url) !== null) this.#found(structuredClone(url), leaf);
-    });
+    }, this.#state);
     this.#kept = source.slice(undecided);
   }
 };
-function findDataJavaScriptURLs(source, final, add) {
+function findDataJavaScriptURLs(source, final, add, state = {}) {
+  const { inside = false, limit = source.length, searched = true } = state;
   let cursor = 0;
   let quote = -1;
   let unquoted = -1;
   let comma = -1;
   let unquotedComma = -1;
-  let leafEnd = -1;
+  let holder = -1;
+  let holderFrom = -1;
+  let headerComma = -1;
+  let headerBase64 = false;
+  let leafEnd = state.leafEnd ?? -1;
+  const undecided = (index) => {
+    state.leafEnd = leafEnd - index;
+    return index;
+  };
+  const headerEnd = (start) => {
+    if (comma < start + DATA_PREFIX.length) {
+      comma = source.indexOf(",", start + DATA_PREFIX.length);
+      if (comma < 0 && final) comma = source.length;
+    }
+    return comma;
+  };
+  const isBase64Header = (start, end) => {
+    if (end !== headerComma) {
+      headerComma = end;
+      headerBase64 = end < source.length && /;\s*base64\s*$/i.test(source.slice(start, end));
+    }
+    return headerBase64;
+  };
+  let runComma = -1;
+  let run;
+  const base64Run = (comma2) => {
+    if (comma2 !== runComma) {
+      runComma = comma2;
+      run = base64URLEnd(source, comma2);
+    }
+    return run;
+  };
+  const closers = {};
+  const closingQuote = (index, character) => {
+    const known = closers[character];
+    if (known && known.from <= index && index <= known.end) return known.end;
+    const end = findClosingQuote(source, index, character);
+    closers[character] = { from: index, end };
+    return end;
+  };
   for (; ; ) {
     if (quote < cursor) quote = nextMatch(QUOTE, source, cursor);
     if (unquoted < cursor) unquoted = nextMatch(DATA_URL_START, source, cursor);
+    if (inside && Math.min(quote, unquoted) >= limit) return source.length;
     if (quote < unquoted) {
-      const literal = startsDataURL(source, quote + 1, source[quote], final);
-      if (literal === void 0) return quote;
-      const plain = literal && source.slice(quote + 1, quote + 1 + DATA_PREFIX.length).toLowerCase() === DATA_PREFIX;
-      if (!literal || !plain && quote < leafEnd) {
+      const prefixEnd = startsDataURL(source, quote + 1, source[quote], final);
+      if (prefixEnd === void 0) return undecided(quote);
+      const plain = prefixEnd >= 0 && source.slice(quote + 1, quote + 1 + DATA_PREFIX.length).toLowerCase() === DATA_PREFIX;
+      const inLeaf = !plain && quote < leafEnd;
+      if (prefixEnd < 0) {
         cursor = quote + 1;
         continue;
       }
-      const end2 = findClosingQuote(source, quote + 1, source[quote]);
-      if (end2 === source.length && !final) return quote;
+      const end2 = closingQuote(quote + 1, source[quote]);
+      if (inLeaf && end2 >= leafEnd) {
+        cursor = quote + 1;
+        continue;
+      }
+      if (end2 === source.length && !final) return undecided(quote);
+      if (holder < prefixEnd || prefixEnd < holderFrom) {
+        holderFrom = prefixEnd;
+        holder = nextMatch(DATA_URL_START, source, prefixEnd);
+      }
+      const holds = holder < end2;
+      if ((inside || inLeaf) && (holds || end2 === source.length)) {
+        cursor = quote + 1;
+        continue;
+      }
+      let unquotedPrefix = false;
+      let prefixURL;
+      if (!plain && !holds && unquoted < end2) {
+        const header2 = headerEnd(unquoted);
+        if (header2 < 0) return undecided(quote);
+        unquotedPrefix = isBase64Header(unquoted, header2);
+        if (unquotedPrefix) prefixURL = source.slice(unquoted, base64Run(header2).urlEnd);
+      }
       const value = unescapeJavaScriptString(source.slice(quote + 1, end2));
-      if (!plain && unquoted < end2) {
-        add(value, true);
-        leafEnd = end2;
-        cursor = quote + 1;
+      if (plain || !holds && !unquotedPrefix) {
+        add(value, false);
+        if (!inside && quote >= leafEnd) {
+          spanLeaves(source, prefixEnd, end2, searched ? parseDataURL(value) : null, add);
+        }
+        cursor = end2;
         continue;
       }
-      add(value, false);
-      cursor = end2;
+      if (!inside && !inLeaf) {
+        if (urlText(value) !== prefixURL) add(value, true);
+        leafEnd = end2;
+      }
+      cursor = quote + 1;
       continue;
     }
     if (unquoted === source.length) {
-      return final ? source.length : Math.max(cursor, source.length - DATA_PREFIX.length + 1);
+      return undecided(final ? source.length : Math.max(cursor, source.length - DATA_PREFIX.length + 1));
     }
     const start = unquoted;
     cursor = start + DATA_PREFIX.length;
-    if (comma < cursor) comma = source.indexOf(",", cursor);
-    if (comma < 0) {
-      if (!final) return start;
-      comma = source.length;
-    }
-    if (comma === unquotedComma || comma === source.length) continue;
-    unquotedComma = comma;
-    if (!/;\s*base64\s*$/i.test(source.slice(start, comma))) continue;
-    let end = comma + 1;
-    while (end < source.length && isEncodedBase64Character(source, end)) {
-      end += source[end] === "%" ? 3 : 1;
-    }
-    if (end > source.length - 3 && !final) return start;
-    add(source.slice(start, end), false);
+    const header = headerEnd(start);
+    if (header < 0) return undecided(start);
+    if (header === unquotedComma || header === source.length) continue;
+    unquotedComma = header;
+    if (!isBase64Header(start, header)) continue;
+    const { end, urlEnd } = base64Run(header);
+    if (end > source.length - 3 && !final) return undecided(start);
+    add(source.slice(start, urlEnd), false);
     cursor = end;
   }
+}
+function base64URLEnd(source, comma) {
+  let end = comma + 1;
+  let urlEnd = -1;
+  while (end < source.length && isEncodedBase64Character(source, end)) {
+    if (urlEnd < 0 && source[end] === "%" && !isBase64Escape(source, end)) urlEnd = end;
+    end += source[end] === "%" ? 3 : 1;
+  }
+  return { end, urlEnd: urlEnd < 0 ? end : urlEnd };
+}
+function urlText(value) {
+  let start = 0;
+  let end = value.length;
+  while (start < end && value.charCodeAt(start) <= 32) start += 1;
+  while (end > start && value.charCodeAt(end - 1) <= 32) end -= 1;
+  const url = value.slice(start, end);
+  return URL_TAB_OR_NEWLINE.test(url) ? url.replace(new RegExp(URL_TAB_OR_NEWLINE, "g"), "") : url;
+}
+function spanLeaves(source, index, end, body, add) {
+  const leaves = (from, limit) => findDataJavaScriptURLs(
+    source.slice(from, end),
+    true,
+    (url) => add(url, true),
+    { inside: true, limit }
+  );
+  const carried = body && !body.base64 ? carriedText(source, index, end) : null;
+  if (!carried) {
+    leaves(index);
+    return;
+  }
+  leaves(index, carried.start - index);
+  if (carried.end < end) leaves(carried.end);
+}
+function carriedText(source, index, end) {
+  let start = -1;
+  for (let at = index; at < end; ) {
+    const from = at;
+    let character = source[at];
+    at += 1;
+    if (character === "\\") {
+      JAVASCRIPT_ESCAPE.lastIndex = from;
+      const escape = JAVASCRIPT_ESCAPE.exec(source);
+      if (escape !== null) {
+        character = javascriptEscapeValue(...escape);
+        at = JAVASCRIPT_ESCAPE.lastIndex;
+      }
+    }
+    if (character === "#") return start < 0 ? null : { start, end: from };
+    if (character === "," && start < 0) start = at;
+  }
+  return start < 0 ? null : { start, end };
 }
 function nextMatch(pattern, source, index) {
   pattern.lastIndex = index;
@@ -793,8 +922,8 @@ function nextMatch(pattern, source, index) {
 }
 function startsDataURL(source, index, quote, final) {
   for (let matched = 0; matched < DATA_PREFIX.length; ) {
-    if (index >= source.length) return final ? false : void 0;
-    if (source[index] === quote) return false;
+    if (index >= source.length) return final ? -1 : void 0;
+    if (source[index] === quote) return -1;
     let code = source.charCodeAt(index);
     index += 1;
     if (code === 92) {
@@ -802,18 +931,18 @@ function startsDataURL(source, index, quote, final) {
       if (!final && CUT_JAVASCRIPT_ESCAPE.test(source)) return void 0;
       JAVASCRIPT_ESCAPE.lastIndex = index - 1;
       const escape = JAVASCRIPT_ESCAPE.exec(source);
-      if (escape === null) return false;
+      if (escape === null) return -1;
       index = JAVASCRIPT_ESCAPE.lastIndex;
       code = javascriptEscapeValue(...escape).charCodeAt(0);
       if (Number.isNaN(code)) continue;
     }
     if (matched === 0 ? code <= 32 : code === 9 || code === 10 || code === 13) continue;
     if ((code >= 65 && code <= 90 ? code + 32 : code) !== DATA_PREFIX.charCodeAt(matched)) {
-      return false;
+      return -1;
     }
     matched += 1;
   }
-  return true;
+  return index;
 }
 function findClosingQuote(source, index, quote) {
   for (let end = source.indexOf(quote, index); end >= 0; end = source.indexOf(quote, end + 1)) {
@@ -842,6 +971,10 @@ function isEncodedBase64Character(source, index) {
     return true;
   }
   return character === "%" && index + 2 < source.length && /^[0-9A-Fa-f]{2}$/.test(source.slice(index + 1, index + 3));
+}
+function isBase64Escape(source, index) {
+  const code = escapedByte(source, index);
+  return code === 61 || isASCIIWhitespace(code) || code >= 0 && BASE64_VALUES[code] >= 0;
 }
 
 // src/request-body.js
@@ -907,16 +1040,15 @@ var SCAN_LANES = Object.freeze([
 ]);
 var VIEWPOINT_TURNS = 4;
 var ScanScheduler = class {
-  // Tasks carry an opaque navigation owner. isLive(tabId, navigation) decides
-  // whether that owner's work is still wanted, and isShown(tabId, navigation)
-  // whether it belongs to the document its tab shows or loads; other live
-  // work (a back/forward cached document's) is background work. No task is
-  // picked before viewpointKnown settles, so a restarted worker does not take
+  // Live work isShown rejects (a back/forward cached document's) is background work.
+  // No task is picked before viewpointKnown settles, so a restarted worker does not take
   // the viewed tab's first work for background work.
-  constructor(isLive, { isShown = isLive, viewpointKnown: viewpointKnown2 } = {}) {
+  constructor(isLive, { isShown = isLive, viewpointKnown: viewpointKnown2, scan } = {}) {
     this.isLive = isLive;
     this.isShown = isShown;
     this.viewpointKnown = viewpointKnown2;
+    this.scan = scan;
+    this.carried = void 0;
     this.tabs = /* @__PURE__ */ new Map();
     this.size = 0;
     this.sequence = 0;
@@ -931,9 +1063,13 @@ var ScanScheduler = class {
   setViewpointTab(tabId) {
     this.viewpointTabId = tabId;
   }
-  // frameId is the Chrome frame the work came from; 0 is the top document.
-  schedule(tabId, navigation, lane, operation, frameId = 0) {
+  // job.buffers() runs only when the task is taken, so queued work holds no buffers.
+  schedule(tabId, navigation, lane, job, frameId = 0) {
     return new Promise((resolve, reject) => {
+      if (!this.isLive(tabId, navigation)) {
+        resolve({ stale: true });
+        return;
+      }
       if (!this.tabs.has(tabId)) this.tabs.set(tabId, /* @__PURE__ */ new Map());
       const navigations = this.tabs.get(tabId);
       if (!navigations.has(navigation)) {
@@ -948,7 +1084,7 @@ var ScanScheduler = class {
         navigation,
         frameId,
         sequence: this.sequence++,
-        operation,
+        job,
         resolve,
         reject
       });
@@ -957,7 +1093,6 @@ var ScanScheduler = class {
       void this.drain();
     });
   }
-  // Releases the queued work of the tab's navigations that are no longer live.
   discardStale(tabId) {
     const navigations = this.tabs.get(tabId);
     if (!navigations) return;
@@ -990,28 +1125,68 @@ var ScanScheduler = class {
         await this.viewpointKnown;
         this.viewpointKnown = void 0;
       }
-      while (this.size > 0) {
-        const task = this.takeNext();
-        if (!this.isLive(task.tabId, task.navigation)) {
-          task.resolve({ stale: true });
-          continue;
-        }
-        try {
-          task.resolve(await task.operation());
-        } catch (error) {
-          task.reject(error);
-        }
+      while (this.size > 0 || this.carried) {
+        await this.runBatch(this.takeBatch());
       }
     } finally {
       this.running = false;
-      if (this.size > 0) {
+      if (this.size > 0 || this.carried) {
         void this.drain();
       }
     }
   }
-  // The viewpoint tab's shown work comes first, and while background work
-  // waits, one background task runs after every VIEWPOINT_TURNS viewpoint
-  // tasks. Background tabs take turns in tab ID order, one task each.
+  // Work queued while a request is in flight shares the next one: a scanner round trip
+  // costs far more than scanning a short buffer.
+  takeBatch() {
+    const batch = [];
+    let bytes = 0;
+    let buffers = 0;
+    while (this.carried || this.size > 0) {
+      const task = this.carried ?? this.takeNext();
+      this.carried = void 0;
+      if (!this.isLive(task.tabId, task.navigation)) {
+        task.resolve({ stale: true });
+        continue;
+      }
+      try {
+        task.buffers ??= task.job.buffers();
+      } catch (error) {
+        task.reject(error);
+        continue;
+      }
+      const size = task.buffers.reduce((total, buffer) => total + buffer.byteLength, 0);
+      if (batch.length > 0 && (bytes + size > MAX_SCAN_BYTES || buffers + task.buffers.length > MAX_SCAN_BUFFERS)) {
+        this.carried = task;
+        break;
+      }
+      batch.push(task);
+      bytes += size;
+      buffers += task.buffers.length;
+    }
+    return batch;
+  }
+  // Records results before the next request is chosen, so a match is presented first.
+  async runBatch(batch) {
+    const buffers = batch.flatMap((task) => task.buffers);
+    let results;
+    try {
+      results = buffers.length > 0 ? await this.scan(buffers) : [];
+    } catch (error) {
+      results = buffers.map(() => ({ error }));
+    }
+    let offset = 0;
+    for (const task of batch) {
+      const taskResults = results.slice(offset, offset + task.buffers.length);
+      offset += task.buffers.length;
+      task.buffers = void 0;
+      try {
+        task.resolve(await task.job.record(taskResults));
+      } catch (error) {
+        task.reject(error);
+      }
+    }
+  }
+  // Background tabs take turns in tab ID order, one task each.
   takeNext() {
     const viewpointQueues = this.queuesOf(this.viewpointTabId, true);
     const viewpointSize = viewpointQueues.reduce((size, queue) => size + queue.size, 0);
@@ -1044,10 +1219,8 @@ var ScanScheduler = class {
       () => this.takeFromFrames(selectedTabId, queues)
     );
   }
-  // Takes the next task of a document's lanes (groups: each of its
-  // navigations' lanes): its urgent lanes in order, then the other lanes in
-  // turn from the lane after the one served last (cursors.get(key)), the
-  // frame lane served by takeFrames, then a lane outside both classes.
+  // Urgent lanes in order, then the other lanes round-robin from the one after the last
+  // served; groups are the lanes of each of the document's navigations.
   takeFromLanes(groups, urgentLanes, cursors, key, takeFrames) {
     for (const lane of urgentLanes) {
       const task = this.takeFromLane(groups, lane);
@@ -1063,10 +1236,8 @@ var ScanScheduler = class {
         return task;
       }
     }
-    return this.takeFromLane(groups);
+    return void 0;
   }
-  // The queues of the tab's navigations that are the viewpoint's work (its
-  // shown documents in the viewpoint tab), or else background work.
   queuesOf(tabId, viewpoint) {
     const queues = [];
     for (const [navigation, queue] of this.tabs.get(tabId) ?? []) {
@@ -1076,22 +1247,18 @@ var ScanScheduler = class {
     }
     return queues;
   }
-  // Takes the earliest task of the lane, or of any lane, among the groups.
   takeFromLane(groups, lane) {
     let earliest;
     for (const group of groups) {
-      for (const [key, tasks] of lane === void 0 ? group.lanes : [[lane, group.lanes.get(lane)]]) {
-        if (tasks && (!earliest || tasks.first().sequence < earliest.tasks.first().sequence)) {
-          earliest = { ...group, key, tasks };
-        }
+      const tasks = group.lanes.get(lane);
+      if (tasks && (!earliest || tasks.first().sequence < earliest.tasks.first().sequence)) {
+        earliest = { ...group, key: lane, tasks };
       }
     }
     return earliest && this.take(earliest);
   }
-  // Frames take turns in frame ID order, one task each, so one busy frame
-  // cannot hold back the others. Within its turn a frame's lanes are served
-  // like the top document's, so a frame's queued request bodies or scripts
-  // cannot hold back its own document changes.
+  // Frames take turns, one task each, so one busy frame cannot hold back the others. A
+  // frame's lanes rotate too, so its bodies or scripts cannot hold back its document.
   takeFromFrames(tabId, queues) {
     const lastFrameId = this.frameCursors.get(tabId) ?? 0;
     let first;
@@ -1127,7 +1294,6 @@ var ScanScheduler = class {
     if (lanes.size === 0 && frameId !== void 0) this.forgetFrame(task.tabId, frameId);
     return task;
   }
-  // Forgets the lane cursor of a frame once none of its tab's work is queued.
   forgetFrame(tabId, frameId) {
     for (const queue of this.tabs.get(tabId)?.values() ?? []) {
       if (queue.frames.has(frameId)) return;
@@ -1165,12 +1331,12 @@ var Queue = class {
 };
 
 // src/bounded-response.js
-async function readBoundedResponseText(response, { maxBytes, maxChars } = {}) {
+async function readBoundedResponseText(response, { maxBytes } = {}) {
   if (!response.body?.getReader) {
     throw new Error("Response body is not readable");
   }
-  if (!Number.isInteger(maxBytes) || maxBytes < 1 || !Number.isInteger(maxChars) || maxChars < 1) {
-    throw new Error("Response body limits are invalid");
+  if (!Number.isInteger(maxBytes) || maxBytes < 1) {
+    throw new Error("Response body limit is invalid");
   }
   const reader = response.body.getReader();
   const decoder = new TextDecoder();
@@ -1193,18 +1359,12 @@ async function readBoundedResponseText(response, { maxBytes, maxChars } = {}) {
       } else {
         bytesRead += value.byteLength;
         text += decoder.decode(value, { stream: true });
-        truncated = text.length > maxChars;
       }
     }
-    return {
-      text: text.slice(0, maxChars),
-      truncated: truncated || text.length > maxChars
-    };
+    return { text, truncated };
   } finally {
-    if (!reachedEnd) {
-      void reader.cancel().catch(() => {
-      });
-    }
+    if (!reachedEnd) void reader.cancel().catch(() => {
+    });
   }
 }
 
@@ -1248,7 +1408,7 @@ async function reportDetections({ url: rawURL, matches, matchedAt, extensionVers
   const url = reportURL(rawURL);
   if (!url) return;
   const ruleIDs = [...new Set(matches.map((match) => match.rule))];
-  if (ruleIDs.some((rule) => !/^clicknix_[1-9]\d*$/.test(rule))) {
+  if (ruleIDs.some((rule) => !/^[A-Za-z_][A-Za-z0-9_]{0,127}$/.test(rule))) {
     throw new Error("Invalid reporting rule ID");
   }
   let failure;
@@ -1329,8 +1489,7 @@ async function requestJSON(path, options, signal, expectedStatus) {
     throw new Error(`bsentinel HTTP ${response.status}`);
   }
   const { text, truncated } = await readBoundedResponseText(response, {
-    maxBytes: MAX_RESPONSE_BYTES,
-    maxChars: MAX_RESPONSE_BYTES
+    maxBytes: MAX_RESPONSE_BYTES
   });
   if (truncated) throw new Error("Oversized bsentinel response");
   return JSON.parse(text);
@@ -1345,13 +1504,6 @@ var OPENED_TAB_PREFIX = "opened:";
 var PICTURE_IN_PICTURE_PREFIX = "pip:";
 var NOTIFICATION_PREFIX = "clicknix-tab-";
 var WARNING_URL = chrome.runtime.getURL("warning.html");
-var SCRIPT_IDLE_TIMEOUT_MS = 8e3;
-var URGENT_SCRIPT_PREEMPT_MS = 100;
-var MAX_CONCURRENT_EXTERNAL_SCRIPTS = 4;
-var MAX_CONCURRENT_URGENT_EXTERNAL_SCRIPTS = 1;
-var MAX_REQUEST_URLS_PER_SCAN = 800;
-var REQUEST_URL_SCAN_INTERVAL_MS = 20;
-var MAX_EVIDENCE = 8;
 var BACK_FORWARD_CACHE_SIZE = 6;
 var MAX_KEPT_URL_CHARS = 2e3;
 var MAX_FRAME_TEXT_DIGESTS = 1024;
@@ -1378,13 +1530,6 @@ var cachedDocuments = /* @__PURE__ */ new Map();
 var tabWarningRequests = /* @__PURE__ */ new Map();
 var openedTabs = /* @__PURE__ */ new Map();
 var openedTabsRestored = restoreTabEntries(OPENED_TAB_PREFIX, openedTabs);
-var externalScriptPools = {
-  normal: { active: 0, limit: MAX_CONCURRENT_EXTERNAL_SCRIPTS, waiters: [] },
-  urgent: { active: 0, limit: MAX_CONCURRENT_URGENT_EXTERNAL_SCRIPTS, waiters: [] },
-  background: { active: 0, limit: MAX_CONCURRENT_EXTERNAL_SCRIPTS, waiters: [] }
-};
-var URGENT_SCRIPT_PREEMPTION = /* @__PURE__ */ Symbol("urgent-script-preemption");
-var activeUrgentScriptAcquisition;
 var viewpointTabId;
 var viewpointQuery;
 var HTTP_REQUEST_FILTER = {
@@ -1394,8 +1539,10 @@ var viewpointKnown = refreshViewpointTab().catch(() => {
 });
 var scanScheduler = new ScanScheduler(isLiveNavigation, {
   isShown: isShownNavigation,
-  viewpointKnown
+  viewpointKnown,
+  scan: scanBatch
 });
+var textEncoder = new TextEncoder();
 var ResultHandlingError = class extends Error {
   constructor(error) {
     super(errorMessage(error));
@@ -1496,12 +1643,7 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
     void getScannerStatus().then((scannerStatus) => sendResponse({
       scannerStatus,
       ...Number.isInteger(message.tabId) ? { scanning: isScanning(message.tabId) } : {}
-    })).catch((error) => sendResponse({
-      scannerStatus: {
-        state: "failed",
-        error: errorMessage(error)
-      }
-    }));
+    })).catch(() => sendResponse({ scannerStatus: { state: "failed" } }));
     return true;
   }
   if (messageType === "continue-warning") {
@@ -1577,24 +1719,24 @@ function setPictureInPictureWindow(tabId, pictureInPicture) {
 }
 async function handleScanMessage(handler, message, sender) {
   const navigation = await navigationForSender(sender);
-  if (!navigation) {
+  const tabId = sender.tab?.id;
+  if (!navigation || !isLiveNavigation(tabId, navigation)) {
     return { ok: true, result: { stale: true } };
   }
-  const tabId = sender.tab.id;
   try {
     const result = await handler(message, sender, navigation);
     return { ok: true, result };
   } catch (error) {
-    await handleScanError(tabId, navigation, message.type, message.url, error);
+    await handleScanError(tabId, navigation, message.url, error);
     return { ok: false, error: errorMessage(error) };
   }
 }
-async function handleScanError(tabId, navigation, source, url, error) {
+async function handleScanError(tabId, navigation, url, error) {
   if (error instanceof ResultHandlingError) {
     return;
   }
   try {
-    await recordScanFailure(tabId, navigation, error, { resourceURL: url, source });
+    await recordScanFailure(tabId, navigation, url);
   } catch {
   }
 }
@@ -1608,15 +1750,12 @@ async function handleTextScan(message, sender, navigation) {
     if (EMPTY_DOCUMENT_MARKUP.test(message.payload)) return { empty: true };
     if (!await claimFrameText(navigation, message.payload)) return { alreadyScanned: true };
   }
-  return scheduleTabScan(tabId, navigation, lane, sender.frameId, async () => {
-    const result = await scanText(message.payload);
-    return recordMatches(tabId, navigation, result, {
-      resourceURL: typeof message.url === "string" ? message.url : navigation.pageURL,
-      resourceType: resourceType || message.resourceType || "Other",
-      source: lane,
-      frameId: sender.frameId,
-      frameURL: sender.url
-    });
+  return scheduleScan(tabId, navigation, lane, sender.frameId, message.payload, {
+    resourceURL: typeof message.url === "string" ? message.url : navigation.pageURL,
+    resourceType: resourceType || message.resourceType || "Other",
+    source: lane,
+    frameId: sender.frameId,
+    frameURL: sender.url
   });
 }
 async function handlePopupDocumentScan(message, sender, navigation) {
@@ -1666,21 +1805,20 @@ async function sha256Hex(text) {
 }
 async function handleExternalScriptScan(message, sender, navigation) {
   const tabId = sender.tab.id;
-  const urgent = message.urgent === true;
   const frame = { frameId: sender.frameId, frameURL: sender.url };
   const fallback = encodingName(message.encoding) ?? "utf-8";
   if (typeof message.url === "string" && message.url.slice(0, 5).toLowerCase() === "data:") {
-    return withExternalScriptSlot(tabId, navigation, urgent, (slot) => scanDataScript(tabId, navigation, message.url, fallback, slot, frame));
+    return trackWork(navigation, () => scanDataScript(tabId, navigation, message.url, fallback, frame));
   }
   let scriptURL;
   try {
     scriptURL = normalizeScriptURL(message.url);
-  } catch (error) {
-    return unavailableResource(message.url, error.message);
+  } catch {
+    return { resourceUnavailable: true };
   }
-  return scanExternalScriptOnce(tabId, navigation, scriptURL, { urgent, fallback, ...frame });
+  return scanExternalScriptOnce(tabId, navigation, scriptURL, { fallback, ...frame });
 }
-async function scanDataScript(tabId, navigation, url, fallback, slot, { frameId, frameURL }) {
+async function scanDataScript(tabId, navigation, url, fallback, { frameId, frameURL }) {
   if (!isLiveNavigation(tabId, navigation)) {
     return { stale: true };
   }
@@ -1689,17 +1827,13 @@ async function scanDataScript(tabId, navigation, url, fallback, slot, { frameId,
   let decoded = false;
   for (const { layer, text } of dataScriptWindows(url, fallback)) {
     decoded = true;
-    await slot.keep();
     try {
-      lastResult = await scheduleTabScan(tabId, navigation, "data-script", frameId, async () => {
-        const result = await scanText(text);
-        return recordMatches(tabId, navigation, result, {
-          resourceURL: `data:#layer-${layer}`,
-          resourceType: "Script",
-          source: "data-script",
-          frameId,
-          frameURL
-        });
+      lastResult = await scheduleScan(tabId, navigation, "data-script", frameId, text, {
+        resourceURL: `data:#layer-${layer}`,
+        resourceType: "Script",
+        source: "data-script",
+        frameId,
+        frameURL
       });
     } catch (error) {
       firstError ??= error;
@@ -1713,7 +1847,7 @@ async function scanDataScript(tabId, navigation, url, fallback, slot, { frameId,
     throw firstError;
   }
   if (!decoded) {
-    return unavailableResource(url, "data script could not be decoded");
+    return { resourceUnavailable: true };
   }
   return lastResult;
 }
@@ -1745,121 +1879,29 @@ async function scanExternalScriptEntry(tabId, navigation, url, options, scans) {
   if (scans.has(fallback)) return { alreadyScanned: true };
   await Promise.all([...scans.values()].map(({ done }) => done));
   if (scanned()) return { alreadyScanned: true };
-  return withExternalScriptSlot(tabId, navigation, options.urgent, async (slot) => {
-    if (!isLiveNavigation(tabId, navigation)) return { stale: true };
-    if (scanned()) return { alreadyScanned: true };
-    let finish;
-    const scan = {
-      done: new Promise((resolve) => {
-        finish = resolve;
-      }),
-      body: void 0
-    };
-    scans.set(fallback, scan);
-    try {
-      const { body, ...result } = await scanExternalScript(tabId, navigation, url, slot, options);
-      if (result.preempted || result.resourceUnavailable) scans.delete(fallback);
-      scan.body = body;
-      return result;
-    } catch (error) {
-      scans.delete(fallback);
-      throw error;
-    } finally {
-      finish();
-    }
-  });
-}
-function withExternalScriptSlot(tabId, navigation, urgent, operation) {
-  return trackWork(navigation, () => holdExternalScriptSlot(tabId, navigation, urgent, operation));
-}
-async function holdExternalScriptSlot(tabId, navigation, urgent, operation) {
-  await viewpointKnown;
-  const waiter = { tabId, navigation };
-  let pool = !isViewpointNavigation(tabId, navigation) ? externalScriptPools.background : externalScriptPools[urgent ? "urgent" : "normal"];
-  if (pool === externalScriptPools.urgent) {
-    await acquireUrgentExternalScriptSlot(pool);
-  } else {
-    pool = await acquireExternalScriptSlot(pool, waiter);
-  }
-  const slot = {
-    get urgent() {
-      return pool === externalScriptPools.urgent;
-    },
-    async keep() {
-      if (pool === externalScriptPools.background || isViewpointNavigation(tabId, navigation)) {
-        return;
-      }
-      if (slot.urgent) activeUrgentScriptAcquisition = void 0;
-      releaseExternalScriptSlot(pool);
-      pool = await acquireExternalScriptSlot(externalScriptPools.background, waiter);
-    }
+  if (!isLiveNavigation(tabId, navigation)) return { stale: true };
+  let finish;
+  const scan = {
+    done: new Promise((resolve) => {
+      finish = resolve;
+    }),
+    body: void 0
   };
+  scans.set(fallback, scan);
   try {
-    return await operation(slot);
+    const { body, ...result } = await trackWork(navigation, () => scanExternalScript(tabId, navigation, url, options));
+    if (result.resourceUnavailable) scans.delete(fallback);
+    scan.body = body;
+    return result;
+  } catch (error) {
+    scans.delete(fallback);
+    throw error;
   } finally {
-    releaseExternalScriptSlot(pool);
+    finish();
   }
 }
-function isViewpointNavigation(tabId, navigation) {
-  return tabId === viewpointTabId && isShownNavigation(tabId, navigation);
-}
-async function acquireUrgentExternalScriptSlot(pool) {
-  while (pool.active >= pool.limit) {
-    const acquisition = activeUrgentScriptAcquisition;
-    if (!acquisition) {
-      await acquireExternalScriptSlot(pool);
-      return;
-    }
-    const stalledFor = acquisition.stalledSince === void 0 ? 0 : Date.now() - acquisition.stalledSince;
-    if (stalledFor < URGENT_SCRIPT_PREEMPT_MS) {
-      await new Promise((resolve) => setTimeout(resolve, URGENT_SCRIPT_PREEMPT_MS - stalledFor));
-      continue;
-    }
-    acquisition.controller.abort(URGENT_SCRIPT_PREEMPTION);
-    await acquireExternalScriptSlot(pool);
-    return;
-  }
-  await acquireExternalScriptSlot(pool);
-}
-function acquireExternalScriptSlot(pool, waiter = {}) {
-  if (pool.active < pool.limit) {
-    pool.active += 1;
-    return Promise.resolve(pool);
-  }
-  return new Promise((resolve) => pool.waiters.push({ ...waiter, resolve }));
-}
-function releaseExternalScriptSlot(pool) {
-  const next = pool.waiters.shift();
-  if (next) {
-    next.resolve(pool);
-  } else {
-    pool.active -= 1;
-  }
-}
-function followViewpoint() {
-  const { normal, background } = externalScriptPools;
-  const viewpoint = ({ tabId, navigation }) => isViewpointNavigation(tabId, navigation);
-  moveExternalScriptWaiters(normal, background, (waiter) => !viewpoint(waiter));
-  moveExternalScriptWaiters(background, normal, viewpoint);
-}
-function moveExternalScriptWaiters(from, to, moves) {
-  const staying = [];
-  for (const waiter of from.waiters) {
-    if (!moves(waiter)) {
-      staying.push(waiter);
-    } else if (to.active < to.limit) {
-      to.active += 1;
-      waiter.resolve(to);
-    } else {
-      to.waiters.push(waiter);
-    }
-  }
-  from.waiters = staying;
-}
-async function scanExternalScript(tabId, navigation, url, slot, { fallback, frameId, frameURL }) {
+async function scanExternalScript(tabId, navigation, url, { fallback, frameId, frameURL }) {
   const controller = new AbortController();
-  const acquisition = slot.urgent ? { controller, stalledSince: void 0 } : null;
-  if (acquisition) activeUrgentScriptAcquisition = acquisition;
   const abortForNavigation = () => controller.abort();
   const navigationSignal = navigation.controller.signal;
   if (navigationSignal.aborted) {
@@ -1867,54 +1909,32 @@ async function scanExternalScript(tabId, navigation, url, slot, { fallback, fram
   } else {
     navigationSignal.addEventListener("abort", abortForNavigation, { once: true });
   }
-  const awaitData = async (read) => {
-    await slot.keep();
-    const promise = read();
-    if (acquisition) acquisition.stalledSince = Date.now();
-    const timer = setTimeout(() => {
-      controller.abort(new Error(`No data for ${SCRIPT_IDLE_TIMEOUT_MS / 1e3} seconds`));
-    }, SCRIPT_IDLE_TIMEOUT_MS);
-    try {
-      return await promise;
-    } finally {
-      clearTimeout(timer);
-      if (acquisition) acquisition.stalledSince = void 0;
-    }
-  };
   let finalURL = url;
-  const unavailable = (error) => {
-    if (controller.signal.reason === URGENT_SCRIPT_PREEMPTION) {
-      return { preempted: true, url: finalURL };
-    }
-    if (!isLiveNavigation(tabId, navigation)) {
-      return { stale: true };
-    }
-    return unavailableResource(finalURL, error instanceof Error ? error.message : String(error));
-  };
+  const unavailable = () => isLiveNavigation(tabId, navigation) ? { resourceUnavailable: true } : { stale: true };
   try {
     let response;
     try {
-      response = await awaitData(() => fetch(url, {
-        cache: "no-store",
+      response = await fetch(url, {
+        cache: "no-cache",
         credentials: "omit",
         signal: controller.signal
-      }));
-    } catch (error) {
-      return unavailable(error);
+      });
+    } catch {
+      return unavailable();
     }
     finalURL = response.url || url;
     if (!isLiveNavigation(tabId, navigation)) {
       return { stale: true };
     }
     if (!response.ok) {
-      return unavailableResource(finalURL, `HTTP ${response.status}`);
+      return { resourceUnavailable: true };
     }
     if (!response.body) {
-      return { empty: true, url: finalURL };
+      return { empty: true };
     }
     const reader = response.body.getReader();
     const readChunk = async () => {
-      const { done, value } = await awaitData(() => reader.read());
+      const { done, value } = await reader.read();
       return done ? null : value;
     };
     const windows = scriptTextWindows(
@@ -1922,43 +1942,28 @@ async function scanExternalScript(tabId, navigation, url, slot, { fallback, fram
       contentTypeCharset(response.headers.get("content-type")),
       fallback
     );
-    let result = { empty: true, url: finalURL };
+    let result = { empty: true };
     for (; ; ) {
       let next;
       try {
         next = await windows.next();
-      } catch (error) {
-        return unavailable(error);
+      } catch {
+        return unavailable();
       }
       if (next.done) return { ...result, body: next.value };
-      const text = next.value;
-      await slot.keep();
-      result = await scheduleTabScan(tabId, navigation, "external-script", frameId, async () => {
-        const scanResult = await scanText(text);
-        return recordMatches(tabId, navigation, scanResult, {
-          resourceURL: finalURL,
-          resourceType: "Script",
-          source: "external-script",
-          frameId,
-          frameURL
-        });
+      result = await scheduleScan(tabId, navigation, "external-script", frameId, next.value, {
+        resourceURL: finalURL,
+        resourceType: "Script",
+        source: "external-script",
+        frameId,
+        frameURL
       });
       if (result?.stale) return result;
     }
   } finally {
-    if (activeUrgentScriptAcquisition === acquisition) {
-      activeUrgentScriptAcquisition = void 0;
-    }
     navigationSignal.removeEventListener("abort", abortForNavigation);
     controller.abort();
   }
-}
-function unavailableResource(url, reason) {
-  return {
-    resourceUnavailable: true,
-    url: boundedURL(url),
-    reason: String(reason).slice(0, 500)
-  };
 }
 function boundedURL(url) {
   if (typeof url !== "string") return void 0;
@@ -1995,6 +2000,7 @@ async function handleNetworkRequest(tabDetails) {
       return;
     }
     const navigation = beginTopLevelRequest(details);
+    if (await isContinuedPage(details.tabId, details.url)) stopNavigation(details.tabId, navigation);
     return scanNetworkRequest(details, { navigation, frameId: 0, frameURL: details.url }, requestBody);
   }
   const frameNavigation = details.type === "sub_frame" || details.type === "object" && details.documentId === void 0;
@@ -2019,7 +2025,7 @@ async function handleNetworkRequest(tabDetails) {
 async function scanNetworkRequest(details, source, requestBody) {
   const { navigation, frameId, frameURL } = source;
   if (!isLiveNavigation(details.tabId, navigation)) {
-    return { stale: true };
+    return;
   }
   if (details.type === "main_frame") {
     navigation.scannedURL = details.url;
@@ -2039,54 +2045,39 @@ async function scanNetworkRequest(details, source, requestBody) {
     return;
   }
   for (const bytes of byteWindows(requestBody)) {
-    const scan = await scheduleTabScan(details.tabId, navigation, "request-body", frameId, async () => {
-      let bodyResult;
-      try {
-        bodyResult = await scanBytes(bytes);
-      } catch (error) {
-        await recordScanFailure(details.tabId, navigation, error, {
-          resourceURL: details.url,
-          source: "request-body"
-        });
-      }
-      if (bodyResult) {
-        try {
-          await recordMatches(details.tabId, navigation, bodyResult, {
-            resourceURL: details.url,
-            resourceType: details.type || "Other",
-            source: "request-body",
-            frameId,
-            frameURL
-          });
-        } catch {
-        }
-      }
-    });
-    if (scan?.stale) return scan;
+    const scan = await scheduleScan(details.tabId, navigation, "request-body", frameId, bytes, {
+      resourceURL: details.url,
+      resourceType: details.type || "Other",
+      source: "request-body",
+      frameId,
+      frameURL
+    }).catch((error) => handleScanError(details.tabId, navigation, details.url, error));
+    if (scan?.stale) return;
   }
-  return { scanned: true };
 }
 function queueRequestURL(tabId, navigation, url, frameId, frameURL) {
   const requests = navigation.requestURLs;
-  if (requests.seen.has(url)) return;
-  if (requests.seenChars + url.length > MAX_CAPTURE_CHARS) {
-    requests.seen.clear();
-    requests.seenChars = 0;
-  }
-  requests.seen.add(url);
-  requests.seenChars += url.length;
   requests.queued.push(url, frameId, frameURL);
   if (!requests.scheduled) scheduleRequestURLs(tabId, navigation);
 }
 function scheduleRequestURLs(tabId, navigation) {
-  navigation.requestURLs.scheduled = true;
-  void scheduleTabScan(tabId, navigation, "request-url", 0, () => scanRequestURLs(tabId, navigation)).catch((error) => handleScanError(tabId, navigation, "request-url", navigation.pageURL, error));
-}
-async function scanRequestURLs(tabId, navigation) {
   const requests = navigation.requestURLs;
+  requests.scheduled = true;
+  let contexts;
+  void scheduleTabScan(tabId, navigation, "request-url", 0, {
+    buffers() {
+      requests.scheduled = false;
+      contexts = takeRequestURLs(requests);
+      if (requests.queued.length > 0) scheduleRequestURLs(tabId, navigation);
+      return contexts.map((context) => textEncoder.encode(context.resourceURL));
+    },
+    record: (results) => recordRequestURLs(tabId, navigation, contexts, results)
+  }).catch((error) => handleScanError(tabId, navigation, navigation.pageURL, error));
+}
+function takeRequestURLs(requests) {
   const contexts = [];
   let length = 0;
-  while (requests.queued.length > 0 && contexts.length < MAX_REQUEST_URLS_PER_SCAN) {
+  while (requests.queued.length > 0 && contexts.length < MAX_SCAN_BUFFERS) {
     const url = requests.queued.first();
     if (contexts.length > 0 && length + url.length > MAX_SCAN_BYTES) break;
     length += url.length;
@@ -2098,25 +2089,16 @@ async function scanRequestURLs(tabId, navigation) {
       frameURL: requests.queued.shift()
     });
   }
-  if (requests.queued.length > 0) {
-    scheduleRequestURLs(tabId, navigation);
-  } else {
-    setTimeout(() => {
-      if (requests.queued.length > 0) {
-        scheduleRequestURLs(tabId, navigation);
-      } else {
-        requests.scheduled = false;
-      }
-    }, REQUEST_URL_SCAN_INTERVAL_MS);
-  }
-  const encoder = new TextEncoder();
-  const results = await scanBatch(contexts.map((context) => encoder.encode(context.resourceURL)));
+  return contexts;
+}
+async function recordRequestURLs(tabId, navigation, contexts, results) {
   const failed = results.findIndex((result) => result.error);
   if (failed !== -1) {
-    await recordScanFailure(tabId, navigation, results[failed].error, contexts[failed]);
+    await recordScanFailure(tabId, navigation, contexts[failed].resourceURL);
   }
-  const scanned = results.filter((result) => !result.error);
-  if (scanned.length === 0) return;
+  const matched = results.findIndex((result) => result.matches?.length > 0);
+  const recorded = matched !== -1 ? matched : results.findIndex((result) => !result.error);
+  if (recorded === -1) return;
   const page = {
     resourceURL: navigation.pageURL,
     resourceType: "Other",
@@ -2124,49 +2106,25 @@ async function scanRequestURLs(tabId, navigation) {
     frameId: 0,
     frameURL: navigation.documentURL
   };
-  const matched = contexts.filter((_context, index) => results[index].matches?.length > 0);
-  return recordMatches(tabId, navigation, {
-    rulesVersion: scanned[0].rulesVersion,
-    matches: scanned.flatMap((result) => result.matches),
-    warnings: scanned.flatMap((result) => result.warnings)
-  }, page, matched.length > 0 ? matched : [page]);
+  return recordMatches(tabId, navigation, results[recorded], page, contexts[recorded]);
 }
 async function scanRequestedScript(tabId, navigation, url, frame) {
   try {
-    await scanExternalScriptOnce(tabId, navigation, url, {
-      urgent: false,
-      fallback: "utf-8",
-      ...frame
-    });
+    await scanExternalScriptOnce(tabId, navigation, url, { fallback: "utf-8", ...frame });
   } catch (error) {
-    await handleScanError(tabId, navigation, "external-script", url, error);
+    await handleScanError(tabId, navigation, url, error);
   }
 }
 async function scanPageURL(tabId, navigation, url, frameId = 0) {
   const source = frameId === 0 ? "top-level-url" : "frame-url";
   if (frameId !== 0 && !await claimFrameText(navigation, url)) return;
-  return scheduleTabScan(tabId, navigation, source, frameId, async () => {
-    let urlResult;
-    try {
-      urlResult = await scanText(url);
-    } catch (error) {
-      await recordScanFailure(tabId, navigation, error, {
-        resourceURL: url,
-        source
-      });
-    }
-    if (!urlResult) return;
-    try {
-      await recordMatches(tabId, navigation, urlResult, {
-        resourceURL: url,
-        resourceType: frameId === 0 ? "main_frame" : "sub_frame",
-        source,
-        frameId,
-        frameURL: url
-      });
-    } catch {
-    }
-  });
+  return scheduleScan(tabId, navigation, source, frameId, url, {
+    resourceURL: url,
+    resourceType: frameId === 0 ? "main_frame" : "sub_frame",
+    source,
+    frameId,
+    frameURL: url
+  }).catch((error) => handleScanError(tabId, navigation, url, error));
 }
 function refreshViewpointTab() {
   const query = Promise.all([
@@ -2176,7 +2134,6 @@ function refreshViewpointTab() {
     if (query !== viewpointQuery) return viewpointQuery;
     viewpointTabId = pictureInPictureOpener(tab?.id) ?? tab?.id;
     scanScheduler.setViewpointTab(viewpointTabId);
-    followViewpoint();
   });
   viewpointQuery = query;
   return query;
@@ -2203,26 +2160,15 @@ function createNavigation(fields) {
   return {
     controller: new AbortController(),
     record: null,
-    // Child frame documents known to belong to this page, with their URLs
-    // (bounded, see boundedURL), the latest MAX_FRAME_DOCUMENTS (see
-    // rememberFrameDocument), and every unlisted (blob:) one.
+    // Child frame documents of this page with bounded URLs, plus unlisted (blob:) ones.
     frameDocuments: /* @__PURE__ */ new Map(),
     unlistedDocuments: /* @__PURE__ */ new Set(),
-    // Documents answered stale only because a document they descend from was
-    // not resolved yet, the latest MAX_FRAME_DOCUMENTS, each with the ID of
-    // that document (see waitForDocument).
+    // Documents answered stale only because an ancestor was unresolved, by waited ID.
     waitingDocuments: /* @__PURE__ */ new Map(),
-    // Child-frame text already claimed for scanning, by SHA-256.
     frameTextDigests: /* @__PURE__ */ new Set(),
-    // External script scans, done or in progress, for all frames, by the
-    // SHA-256 of the URL and by fallback encoding (see scanExternalScriptOnce).
     externalScripts: /* @__PURE__ */ new Map(),
-    // Keys of external scripts no report is handling, idle longest first.
     idleExternalScripts: /* @__PURE__ */ new Set(),
-    // Subresource request URLs seen, those waiting to be scanned (each with
-    // its frame ID and URL) and whether a task will take them.
-    requestURLs: { seen: /* @__PURE__ */ new Set(), seenChars: 0, queued: new Queue(), scheduled: false },
-    // Work queued or in flight (see trackWork).
+    requestURLs: { queued: new Queue(), scheduled: false },
     pendingWork: 0,
     ...fields
   };
@@ -2279,18 +2225,22 @@ function commitTopLevelDocument({ tabId, documentId, url, timeStamp }) {
 function commitWarningPage(tabId) {
   const navigation = tabWarningRequests.get(tabId);
   tabWarningRequests.delete(tabId);
-  if (!navigation) return;
-  const committed = tabDocuments.get(tabId) === navigation;
-  if (!committed) replaceTabDocument(tabId, navigation);
+  const takeover = navigation !== void 0 && tabDocuments.get(tabId) !== navigation;
+  if (takeover) replaceTabDocument(tabId, navigation);
   void queueTabStateUpdate(tabId, async () => {
-    if (tabDocuments.get(tabId) !== navigation) return;
-    if (!committed) {
+    if (takeover && tabDocuments.get(tabId) === navigation) {
       await chrome.storage.session.remove(`${WARNING_ALLOW_PREFIX}${tabId}`);
       await writeNavigationRecord(tabId, navigation, navigation.record);
     }
-    await setFlaggedBadge(tabId);
+    if (await isOwnerFlagged(tabId)) await setFlaggedBadge(tabId);
   }).catch(() => {
   });
+}
+async function isOwnerFlagged(tabId) {
+  const owner = tabDocuments.get(tabId);
+  const stateKey = `${TAB_STATE_PREFIX}${tabId}`;
+  const record = owner ? await readNavigationRecord(tabId, owner) : (await chrome.storage.session.get(stateKey))[stateKey];
+  return record?.matches?.length > 0;
 }
 function replaceTabDocument(tabId, navigation) {
   const previous = tabDocuments.get(tabId);
@@ -2299,7 +2249,6 @@ function replaceTabDocument(tabId, navigation) {
   if (tabPendingRequests.get(tabId) === navigation) tabPendingRequests.delete(tabId);
   if (previous && previous !== navigation) keepCachedDocument(tabId, previous);
   scanScheduler.discardStale(tabId);
-  followViewpoint();
 }
 function keepCachedDocument(tabId, navigation) {
   if (navigation.documentId === void 0) {
@@ -2328,9 +2277,14 @@ async function settleCommittedDocument(tabId, navigation, warned) {
   const continued = (await chrome.storage.session.get(allowKey))[allowKey];
   let state = await updateWarningDocument(tabId, navigation.documentId);
   if (sameHTTPURLWithoutFragment(continued?.url, navigation.pageURL)) {
-    state = await updateWarningDocument(tabId, navigation.documentId, { allowed: true });
+    state = await updateWarningDocument(tabId, navigation.documentId, {
+      url: boundedURL(navigation.pageURL),
+      matches: continued.matches ?? [],
+      allowed: true
+    });
   }
   await chrome.storage.session.remove([warningKey, allowKey]);
+  if (state?.matches || state?.allowed) stopNavigation(tabId, navigation);
   if (state?.matches && !navigation.record) {
     navigation.record = void 0;
     navigation.pageURL ??= state.url;
@@ -2354,7 +2308,6 @@ function flaggedRecord(navigation, matches) {
     url: navigation.pageURL,
     matches,
     evidence: [],
-    warnings: [],
     scanned: true,
     updatedAt: (/* @__PURE__ */ new Date()).toISOString()
   };
@@ -2369,6 +2322,11 @@ async function updateWarningDocument(tabId, documentId, change) {
   entries.push(entry);
   await storeSession({ [key]: entries.slice(-(BACK_FORWARD_CACHE_SIZE + 1)) });
   return entry;
+}
+async function warningDocument(tabId, documentId) {
+  const key = `${WARNING_DOCUMENTS_PREFIX}${tabId}`;
+  const entries = (await chrome.storage.session.get(key))[key] ?? [];
+  return entries.find((entry) => entry.documentId === documentId);
 }
 async function flagDocument(tabId, navigation, change) {
   if (navigation.documentId === void 0) return;
@@ -2505,9 +2463,13 @@ async function tabOwner(tabId) {
 }
 async function navigationForDocument(tabId, documentId) {
   if (!tabDocuments.has(tabId)) {
-    const frame = await getActiveTopLevelFrame(tabId, documentId);
+    const [frame, state] = await Promise.all([
+      getActiveTopLevelFrame(tabId, documentId),
+      warningDocument(tabId, documentId)
+    ]);
     if (frame && !tabDocuments.has(tabId)) {
       restoreTopLevelDocument(tabId, frame);
+      if (state?.matches || state?.allowed) stopNavigation(tabId, tabDocuments.get(tabId));
     }
   }
   const navigation = tabDocuments.get(tabId);
@@ -2542,7 +2504,7 @@ async function openerPageURL(tabId) {
   return openerTabId === void 0 ? void 0 : (await tabOwner(openerTabId))?.pageURL;
 }
 function isLiveNavigation(tabId, navigation) {
-  return isShownNavigation(tabId, navigation) || cachedDocuments.get(tabId)?.get(navigation.documentId) === navigation;
+  return !navigation.controller.signal.aborted && (isShownNavigation(tabId, navigation) || cachedDocuments.get(tabId)?.get(navigation.documentId) === navigation);
 }
 function isShownNavigation(tabId, navigation) {
   return tabDocuments.get(tabId) === navigation || tabPendingRequests.get(tabId) === navigation;
@@ -2573,7 +2535,7 @@ function urlWithoutFragment(value) {
 function sameHTTPURLWithoutFragment(left, right) {
   return isHTTPURL(left) && sameURLWithoutFragment(left, right);
 }
-async function recordMatches(tabId, navigation, result, context, evidence = [context]) {
+async function recordMatches(tabId, navigation, result, context, evidence = context) {
   try {
     return await queueTabStateUpdate(
       tabId,
@@ -2626,8 +2588,17 @@ async function queueTabStateUpdate(tabId, operation) {
     }
   }
 }
-function scheduleTabScan(tabId, navigation, lane, frameId, operation) {
-  return trackWork(navigation, () => scanScheduler.schedule(tabId, navigation, lane, operation, frameId));
+function scheduleTabScan(tabId, navigation, lane, frameId, job) {
+  return trackWork(navigation, () => scanScheduler.schedule(tabId, navigation, lane, job, frameId));
+}
+function scheduleScan(tabId, navigation, lane, frameId, input, context) {
+  return scheduleTabScan(tabId, navigation, lane, frameId, {
+    buffers: () => [typeof input === "string" ? textEncoder.encode(input) : input],
+    record: ([result]) => {
+      if (result.error) throw result.error;
+      return recordMatches(tabId, navigation, result, context);
+    }
+  });
 }
 async function trackWork(navigation, work) {
   navigation.pendingWork += 1;
@@ -2639,9 +2610,14 @@ async function trackWork(navigation, work) {
 }
 function isScanning(tabId) {
   const navigation = tabDocuments.get(tabId);
-  return navigation !== void 0 && (navigation.pendingWork > 0 || navigation.requestURLs.queued.length > 0);
+  return navigation !== void 0 && isLiveNavigation(tabId, navigation) && (navigation.pendingWork > 0 || navigation.requestURLs.queued.length > 0);
 }
-async function recordMatchesNow(tabId, navigation, result, context, resources) {
+function stopNavigation(tabId, navigation) {
+  navigation.controller.abort();
+  navigation.requestURLs.queued = new Queue();
+  scanScheduler.discardStale(tabId);
+}
+async function recordMatchesNow(tabId, navigation, result, context, evidence) {
   if (!isLiveNavigation(tabId, navigation)) {
     return { ...result, stale: true };
   }
@@ -2651,93 +2627,46 @@ async function recordMatchesNow(tabId, navigation, result, context, resources) {
   } catch (error) {
     throw new ResultHandlingError(error);
   }
-  const currentMatches = Array.isArray(currentState?.matches) ? currentState.matches : [];
-  const knownMatches = new Set(currentMatches.map(matchKey));
-  const newMatches = [];
-  for (const match of result.matches) {
-    if (!knownMatches.has(matchKey(match))) {
-      newMatches.push(match);
-      knownMatches.add(matchKey(match));
-    }
+  const url = navigation.pageURL || currentState?.url || context.resourceURL;
+  const matched = result.matches.length > 0;
+  if (!matched && currentState?.scanned === true && currentState.url === url) {
+    return result;
   }
-  const matches = [...currentMatches, ...newMatches];
-  const evidence = Array.isArray(currentState?.evidence) ? [...currentState.evidence] : [];
-  const knownEvidence = new Set(evidence.map((item) => item.key));
-  let evidenceAdded = false;
-  for (const resource of result.matches.length > 0 ? resources : []) {
-    if (evidence.length >= MAX_EVIDENCE) break;
-    const resourceURL = boundedURL(resource.resourceURL);
-    const evidenceKey = `${resource.source}:${resourceURL}:${resource.frameId}`;
-    if (knownEvidence.has(evidenceKey)) continue;
-    knownEvidence.add(evidenceKey);
-    evidenceAdded = true;
-    evidence.push({
-      key: evidenceKey,
-      source: resource.source,
-      resourceType: resource.resourceType,
-      url: resourceURL,
-      frameId: resource.frameId,
-      frameURL: boundedURL(resource.frameURL)
-    });
-  }
-  const warnings = Array.isArray(currentState?.warnings) ? [...currentState.warnings] : [];
-  const knownWarnings = new Set(warnings.map((warning) => JSON.stringify(warning)));
-  let warningsAdded = false;
-  for (const warning of result.warnings || []) {
-    const key = JSON.stringify(warning);
-    if (!knownWarnings.has(key)) {
-      warnings.push(warning);
-      knownWarnings.add(key);
-      warningsAdded = true;
-    }
-  }
-  const nextURL = navigation.pageURL || currentState?.url || context.resourceURL;
-  const unchanged = currentState?.scanned === true && currentState.url === nextURL && newMatches.length === 0 && !evidenceAdded && !warningsAdded;
-  const record = unchanged ? currentState : {
-    url: nextURL,
-    frameId: context.frameId,
+  if (matched) stopNavigation(tabId, navigation);
+  const record = {
+    url,
     rulesVersion: result.rulesVersion,
-    matches,
-    evidence,
-    warnings,
+    matches: result.matches,
+    evidence: matched ? [{
+      source: evidence.source,
+      resourceType: evidence.resourceType,
+      url: boundedURL(evidence.resourceURL),
+      frameId: evidence.frameId,
+      frameURL: boundedURL(evidence.frameURL)
+    }] : [],
     scanned: true,
     ...currentState?.scanFailure ? { scanFailure: currentState.scanFailure } : {},
     updatedAt: (/* @__PURE__ */ new Date()).toISOString()
   };
-  if (!unchanged) {
-    await writeNavigationRecord(tabId, navigation, record);
-  }
-  if (result.matches.length === 0) {
-    return {
-      ...result,
-      duplicate: true,
-      matches: record.matches
-    };
-  }
-  const duplicate = newMatches.length === 0;
+  await writeNavigationRecord(tabId, navigation, record);
+  if (!matched) return result;
   let warningError;
   if (isShownNavigation(tabId, navigation)) {
-    warningError = await presentMatches(tabId, navigation, !duplicate);
-  } else if (!duplicate) {
+    warningError = await presentMatches(tabId, navigation, true);
+  } else {
     await flagDocument(tabId, navigation, { unpresented: true });
   }
-  if (!duplicate) {
-    void reportDetections({
-      url: reportedPageURL(navigation, record, context),
-      matches: newMatches,
-      matchedAt: record.updatedAt,
-      extensionVersion: chrome.runtime.getManifest().version
-    }).catch(() => {
-    });
-  }
+  void reportDetections({
+    url: reportedPageURL(navigation, record, context),
+    matches: result.matches,
+    matchedAt: record.updatedAt,
+    extensionVersion: chrome.runtime.getManifest().version
+  }).catch(() => {
+  });
   if (warningError) {
     throw new ResultHandlingError(warningError);
   }
-  return {
-    ...result,
-    duplicate,
-    matches: record.matches
-  };
+  return result;
 }
 function reportedPageURL(navigation, record, context) {
   if (context.source === "top-level-url") return context.resourceURL;
@@ -2775,7 +2704,10 @@ async function showWarning(tabId, navigation) {
     return;
   }
   const warningKey = `${WARNING_STATE_PREFIX}${tabId}`;
-  const warning = { url: normalizeHTTPURL(navigation.pageURL) };
+  const warning = {
+    url: normalizeHTTPURL(navigation.pageURL),
+    matches: navigation.record?.matches ?? []
+  };
   await Promise.all([
     storeSession({ [warningKey]: warning }),
     flagDocument(tabId, navigation)
@@ -2800,7 +2732,7 @@ async function continueFromWarning(sender) {
     throw new Error("This warning no longer has a blocked site to continue to");
   }
   const url = normalizeHTTPURL(warning.url);
-  await chrome.storage.session.set({ [allowKey]: { url } });
+  await chrome.storage.session.set({ [allowKey]: { url, matches: warning.matches } });
   try {
     await chrome.tabs.update(tabId, { url });
   } catch (error) {
@@ -2810,14 +2742,12 @@ async function continueFromWarning(sender) {
   return { ok: true };
 }
 async function isWarningAllowed(tabId, navigation) {
+  return await isContinuedPage(tabId, navigation.pageURL) || (await warningDocument(tabId, navigation.documentId))?.allowed === true;
+}
+async function isContinuedPage(tabId, url) {
   const allowKey = `${WARNING_ALLOW_PREFIX}${tabId}`;
-  const documentsKey = `${WARNING_DOCUMENTS_PREFIX}${tabId}`;
-  const {
-    [allowKey]: continued,
-    [documentsKey]: documents
-  } = await chrome.storage.session.get([allowKey, documentsKey]);
-  if (sameHTTPURLWithoutFragment(continued?.url, navigation.pageURL)) return true;
-  return (documents ?? []).some((entry) => entry.documentId === navigation.documentId && entry.allowed === true);
+  const continued = (await chrome.storage.session.get(allowKey))[allowKey];
+  return sameHTTPURLWithoutFragment(continued?.url, url);
 }
 function normalizeHTTPURL(value) {
   const url = new URL(value);
@@ -2826,13 +2756,13 @@ function normalizeHTTPURL(value) {
   }
   return url.href;
 }
-async function recordScanFailure(tabId, navigation, error, context) {
+async function recordScanFailure(tabId, navigation, resourceURL) {
   return queueTabStateUpdate(
     tabId,
-    () => recordScanFailureNow(tabId, navigation, error, context)
+    () => recordScanFailureNow(tabId, navigation, resourceURL)
   );
 }
-async function recordScanFailureNow(tabId, navigation, error, context) {
+async function recordScanFailureNow(tabId, navigation, resourceURL) {
   if (!isLiveNavigation(tabId, navigation)) {
     return;
   }
@@ -2840,26 +2770,14 @@ async function recordScanFailureNow(tabId, navigation, error, context) {
     const currentState = await readNavigationRecord(tabId, navigation);
     await writeNavigationRecord(tabId, navigation, {
       ...currentState,
-      url: currentState?.url || navigation.pageURL || context.resourceURL,
+      url: currentState?.url || navigation.pageURL || resourceURL,
       matches: Array.isArray(currentState?.matches) ? currentState.matches : [],
       evidence: Array.isArray(currentState?.evidence) ? currentState.evidence : [],
-      scanFailure: currentState?.scanFailure || {
-        message: (error instanceof Error ? error.message : String(error)).slice(0, 500),
-        source: context.source,
-        url: boundedURL(context.resourceURL),
-        ...error?.scannerFailure ? {
-          code: error.scannerFailure.code,
-          stage: error.scannerFailure.stage,
-          terminal: error.scannerFailure.terminal
-        } : {}
-      },
+      scanFailure: true,
       updatedAt: (/* @__PURE__ */ new Date()).toISOString()
     });
   } catch {
   }
-}
-function matchKey(match) {
-  return `${match.namespace}:${match.rule}`;
 }
 async function setFlaggedBadge(tabId) {
   await Promise.allSettled([
