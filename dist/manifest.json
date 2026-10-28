@@ -1,7 +1,7 @@
 {
   "manifest_version": 3,
   "name": "ClickNix",
-  "version": "0.2.1",
+  "version": "0.2.1.27",
   "minimum_chrome_version": "128",
   "description": "ClickNix locally scans web content and identifies matching threat detections.",
   "icons": {
